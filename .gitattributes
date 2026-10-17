@@ -1,0 +1,19 @@
+# 统一换行符：仓库里一律 LF，Windows 检出时按需转换。
+# 不写这个的话，Windows 上编辑过的文件会以 CRLF 提交，
+# Linux/macOS 上检出后 diff 全是噪音，脚本的 shebang 也可能失效。
+* text=auto eol=lf
+
+# 明确指定语言，GitHub 的语法识别更准
+*.py   text diff=python
+*.md   text
+*.json text
+*.c    text
+*.h    text
+*.bat  text eol=crlf
+*.ps1  text eol=crlf
+
+# 二进制文件不要让 Git 试图转换
+*.png  binary
+*.ico  binary
+*.jpg  binary
+*.zip  binary
