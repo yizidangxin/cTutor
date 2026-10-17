@@ -1,0 +1,24 @@
+{
+  "note": "Top-20 高频错误清单，用于计算「Top-20 命中率」这一更诚实的指标。",
+  "version": 2,
+  "source": [
+    "① 三个开源报错解释项目（dcc 67 条 / CS50 help50 55 条 / c-error-helper 36 条）的合并去重清单——被 3 个项目同时收录的算「确认高频」",
+    "② 本项目 tools/probe_snippets.py 对 MSVC 14.51 与 GCC 16.2 的真实编译实测",
+    "③ 中文社区与高校课程材料（清华《程序设计常见错误》、哈工大 ACM 讲义）的提及密度",
+    "注意：③ 是**定性**判断，不存在权威频次统计。等积累了几周真实使用日志后，应当用 log/unmatched.jsonl 的实际频次替换本清单。"
+  ],
+  "msvc": [
+    "C2146", "C2143", "C2065", "C2059", "C1083", "C1075", "C2440", "C3861",
+    "C4996", "C4716", "C4700", "C4477", "C2057", "C2181", "C4013", "C4047",
+    "LNK1561", "LNK2019", "LNK1104", "C3872"
+  ],
+  "gcc": [
+    "expected ';'", "undeclared", "implicit declaration", "No such file or directory",
+    "stray", "expected declaration or statement at end of input", "expected ')'",
+    "lvalue required", "assignment to expression with array type",
+    "else without a previous if", "control reaches end of non-void",
+    "used uninitialized", "format '", "too few arguments", "too many arguments",
+    "undefined reference to `main'", "undefined reference to", "multiple definition",
+    "is a pointer; did you mean to use '->'", "makes pointer from integer without a cast"
+  ]
+}

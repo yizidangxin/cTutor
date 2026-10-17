@@ -1,0 +1,24 @@
+{
+  "//": "复制为 config/ctutor.json 后按需修改。config/ctutor.json 已被 .gitignore 忽略，不会进仓库。",
+  "compiler": {
+    "prefer": "auto",
+    "gcc_path": "",
+    "vcvars_path": "",
+    "std": "c17",
+    "warnings": true,
+    "timeout_seconds": 30,
+    "max_output_bytes": 2000000
+  },
+  "ai": {
+    "//": "密钥不要写在这里。用环境变量 DEEPSEEK_API_KEY，或写在用户目录（见 README）。",
+    "enabled": false,
+    "model": "deepseek-flash",
+    "timeout_seconds": 45,
+    "max_retries": 1
+  },
+  "log": {
+    "enabled": true,
+    "record_source": false,
+    "user_id": "me"
+  }
+}
