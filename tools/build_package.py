@@ -322,6 +322,43 @@ def assemble(with_toolchain=True):
     return True
 
 
+def clean_runtime():
+    """清空包内的 build/ 与 log/，只保留空目录。
+
+    为什么必须在打包前做：verify() 是在包目录里跑 `ctutor.exe --selftest` 的，
+    自检会写工作副本（build/panel/untitled.c）、SARIF、运行目录，
+    甚至真的编译出一个 a.exe。这些**测试残留**跟着 zip 发出去，
+    既暴露了打包过程，也白白增加体积。
+    """
+    removed = 0
+    for name in ("build", "log"):
+        d = os.path.join(APP, name)
+        if not os.path.isdir(d):
+            os.makedirs(d, exist_ok=True)
+            continue
+        for entry in os.listdir(d):
+            p = os.path.join(d, entry)
+            try:
+                if os.path.isdir(p):
+                    removed += dir_size(p)
+                    shutil.rmtree(p, ignore_errors=True)
+                else:
+                    removed += os.path.getsize(p)
+                    os.remove(p)
+            except OSError:
+                pass
+    left = []
+    for name in ("build", "log"):
+        d = os.path.join(APP, name)
+        if os.path.isdir(d):
+            left.extend("%s/%s" % (name, x) for x in os.listdir(d))
+    if left:
+        log("⚠ 包内 build/log 仍有残留：%s" % "、".join(left[:6]))
+    else:
+        log("已清空包内 build/ 与 log/（移除 %s）" % mb(removed))
+    return not left
+
+
 # ---------------------------------------------------------------- 验证
 def verify():
     """跑打包出来的 exe，用它的自检模式验证：能启动、Monaco 在、能编译、讲解命中。"""
@@ -434,6 +471,9 @@ def main(argv=None) -> int:
         if not verify():
             log("验证失败——先别急着发出去，看看上面的输出")
             return 2
+        # 验证是在**包目录里**跑自检的，会留下工作副本、SARIF、甚至编译出来的 a.exe。
+        # 不清理的话这些测试残留会跟着 zip 一起发给别人（踩过一次：包里有 a.exe）。
+        clean_runtime()
 
     if args.no_zip:
         log("已跳过压缩。目录：%s" % APP)
