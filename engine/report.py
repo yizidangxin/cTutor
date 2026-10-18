@@ -4,6 +4,8 @@
 把报告构造从 cli.py 抽出来，好处是「一份 schema，两个消费者」——
 界面层不需要解析人类可读文本，只要读这个 JSON 即可。
 """
+import os
+
 from typing import Any, Dict, Optional
 
 from . import render
@@ -76,5 +78,35 @@ def check_once(source: str, depth: int = render.DEFAULT_DEPTH,
     elif exp is not None and use_ai and exp.matched:
         exp.ai_meta = "本地知识库已命中，未调用模型（零成本零延迟）"
         ai_meta = exp.ai_meta
+
+    # 记日志：**面板走的正是这条路径**。
+    #
+    # 踩过的坑：日志原来只写在 cli.py 的 cmd_check 里，而面板调用的是 check_once——
+    # 结果是"用面板（主要使用方式）时，待补清单永远是空的"。
+    # 而「数据驱动知识库增长」是这个项目的核心设计之一，等于对 GUI 用户完全失效。
+    # 日志失败绝不能影响主流程，所以整段包在 try 里。
+    try:
+        from . import jsonlog
+        jsonlog.event("check", cfg,
+                      file=os.path.basename(source), compiler=comp.name,
+                      returncode=res.returncode, n_diags=len(res.diagnostics),
+                      sarif=getattr(res, "sarif_status", ""),
+                      timed_out=getattr(res, "timed_out", False),
+                      matched=bool(exp is not None and exp.matched))
+        if exp is not None and not exp.matched:
+            jsonlog.unmatched(chosen, cfg, os.path.basename(source), exp.line_text)
+    except Exception as e:                                      # noqa: BLE001
+        # 日志失败绝不能影响主流程，但也**不能纯静默**。
+        # 之前这里写的就是 `pass`，结果吞掉了一个 NameError（report.py 忘了 import os），
+        # 导致“面板从来不写日志”这个 bug 藏了很久——正是本项目在别处一直批评的
+        # “静默吞错”反模式，自己又踩了一次。
+        try:
+            import traceback as _tb
+            _p = os.path.join(config_mod.path_of("log", cfg), "jsonlog_error.log")
+            with open(_p, "a", encoding="utf-8") as _f:
+                _f.write("%s: %s\n" % (type(e).__name__, e))
+                _f.write(_tb.format_exc() + "\n")
+        except Exception:                                       # noqa: BLE001
+            pass
 
     return build_report(comp.name, source, res, chosen, exp, ai_meta, depth)
