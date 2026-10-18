@@ -35,14 +35,16 @@ from PySide6.QtGui import QAction, QFont, QFontDatabase, QKeySequence  # noqa: E
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox,   # noqa: E402
                                QDialog, QFileDialog, QHBoxLayout, QInputDialog, QLabel,
                                QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit,
-                               QPushButton, QSpinBox, QSplitter, QTabWidget,
+                               QPushButton, QSpinBox, QSplitter, QTabBar, QTabWidget,
                                QTextBrowser, QVBoxLayout, QWidget)
 from engine import ai as ai_mod                                     # noqa: E402
 from engine import completion as completion_mod                     # noqa: E402
 from engine import config as config_mod                             # noqa: E402
 from engine import compilers as compilers_mod                       # noqa: E402
 from engine import editorui as editorui_mod                         # noqa: E402
+from engine import format as format_mod                             # noqa: E402
 from engine import report as report_mod                             # noqa: E402
+from engine import session as session_mod                           # noqa: E402
 import newproject as newproject_mod                                 # noqa: E402
 from engine.encoding import detect_source_encoding, encoding_label, read_source  # noqa: E402
 
@@ -368,6 +370,51 @@ class AITestWorker(QThread):
             self.done.emit(False, repr(e))
 
 
+# ---------------------------------------------------------------- 文档模型
+def _norm_text(s: str) -> str:
+    """统一成 \n 换行。
+
+    实测：Monaco 会把文本里的 \\n 归一成 \\r\\n 返回。如果不统一，
+    "刚打开的文件"和"模型里的基线"永远差一个 \\r，于是**每个文件一打开就被判成已修改**，
+    退出时会白问一遍"要保存吗"。
+    """
+    return s.replace("\r\n", "\n").replace("\r", "\n")
+
+
+class Doc:
+    """一个打开的文件。
+
+    为什么多个项目**共用一个编辑器**而不是每个标签一个 Monaco：
+    Monaco 是内嵌的 Chromium，一个实例就要几百 MB 内存；开 5 个标签等于开 5 个浏览器。
+    所以这里用"标签栏 + 单编辑器"：切标签时把当前编辑框里的文本存回模型、
+    再把目标文档的文本灌进去。对初学者那几个小文件来说，切换是瞬间的。
+
+    text 是"最后一次同步时的文本"，用来判断有没有改动（和编辑器里的实时文本比对）。
+    """
+
+    __slots__ = ("path", "encoding", "text", "saved_text", "label", "modified",
+                 "marks", "format_undo")
+
+    def __init__(self, path=None, encoding="mbcs", text="", label="未命名"):
+        self.path = path
+        self.encoding = encoding
+        self.text = text
+        self.saved_text = text     # 上次保存/打开时的内容，用来判断有没有改动
+        self.label = label
+        self.modified = False
+        self.marks = []          # 切回来时恢复上一轮的标红
+        self.format_undo = None  # 对齐之前的文本（一步撤销用）
+
+    def title(self) -> str:
+        base = os.path.basename(self.path) if self.path else self.label
+        return ("* " + base) if self.modified else base
+
+    def tooltip(self) -> str:
+        if self.path:
+            return "%s\n（%s）" % (self.path, encoding_label(self.encoding))
+        return "还没保存到文件"
+
+
 # ---------------------------------------------------------------- 主窗口
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -380,15 +427,29 @@ class MainWindow(QMainWindow):
             _app._ctutor_font_ready = True
         self.setWindowTitle("ctutor — C 语言报错解释器")
         self.resize(1360, 880)
-        self.path = None
-        self.encoding = "mbcs"
+        # 多文档：一个标签 = 一个打开的文件（可以是不同项目里的）
+        self.docs = []
+        self.cur = -1
+        self._switching = False          # 切标签时防止信号回环
+        self._dirty_error = ""
         self.editor = EditorAdapter()
         self.worker = None
         self.run_worker = None
         self._explanation_html = ""          # 最近一次的讲解（供「帮助」关闭后恢复）
         self._zoom = 0                       # 相对默认字号的缩放步数
+        self._restoring = True               # 恢复会话期间不要回写会话
         self._build_ui()
-        self._load_sample()
+        # 接着上次写：恢复上次打开的标签（含未保存的改动）；没有就展示示例
+        if not self._restore_session():
+            self._load_sample()
+        self._restoring = False
+        # 定时比对"编辑器里的文本 vs 文档模型里的文本"，用来给标签加 * 号。
+        # 不挂在 Monaco 的 onDidChangeModelContent 上：切标签时 set_text 也会触发它，
+        # 结果一切换就变成"已修改"——用文本比对最笨也最准。
+        self._dirty_timer = QTimer(self)
+        self._dirty_timer.setInterval(1200)
+        self._dirty_timer.timeout.connect(self._poll_dirty)
+        self._dirty_timer.start()
         # 缩放的事件过滤器挂到应用级别：Monaco 内嵌 Chromium 会吞掉快捷键，
         # 挂在这里才能在事件送达焦点控件之前拦住（也才能被自动化测试验证）。
         _app = QApplication.instance()
@@ -404,6 +465,256 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(1200, self._apply_zoom)
         # 补全脚本在页面加载后异步注册，稍等一下再查询状态
         QTimer.singleShot(1500, self._check_completion_status)
+
+    # ---------- 当前文档（保留 self.path / self.encoding 的旧写法） ----------
+    def _doc(self):
+        if 0 <= self.cur < len(self.docs):
+            return self.docs[self.cur]
+        return None
+
+    @property
+    def path(self):
+        d = self._doc()
+        return d.path if d else None
+
+    @path.setter
+    def path(self, value):
+        d = self._doc()
+        if d is not None:
+            d.path = value
+
+    @property
+    def encoding(self):
+        d = self._doc()
+        return d.encoding if d else "mbcs"
+
+    @encoding.setter
+    def encoding(self, value):
+        d = self._doc()
+        if d is not None:
+            d.encoding = value
+
+    # ---------- 多文档管理 ----------
+    def _sync_tabs(self):
+        """把文档列表同步到标签栏（标题、提示、当前页）。"""
+        self._switching = True
+        try:
+            self.tabbar.blockSignals(True)
+            if self.tabbar.count() != len(self.docs):
+                while self.tabbar.count():
+                    self.tabbar.removeTab(0)
+                for d in self.docs:
+                    self.tabbar.addTab(d.title())
+            for i, d in enumerate(self.docs):
+                if i < self.tabbar.count() and self.tabbar.tabText(i) != d.title():
+                    self.tabbar.setTabText(i, d.title())
+                if i < self.tabbar.count():
+                    self.tabbar.setTabToolTip(i, d.tooltip())
+            if 0 <= self.cur < self.tabbar.count():
+                self.tabbar.setCurrentIndex(self.cur)
+            self.tabbar.blockSignals(False)
+            self._update_file_label()
+        finally:
+            self._switching = False
+
+    def _update_file_label(self):
+        d = self._doc()
+        if d is None:
+            self.lbl_file.setText("")
+            return
+        if d.path:
+            where = d.path
+        else:
+            where = "还没保存到文件"
+        if d.modified:
+            where += "　● 未保存"
+        self.lbl_file.setText("%s　（%s）" % (where, encoding_label(d.encoding)))
+
+    def _flush(self):
+        """把编辑器里的内容存回当前文档模型，并更新改动标记。"""
+        d = self._doc()
+        if d is None:
+            return
+        try:
+            txt = _norm_text(self.editor.text())
+        except Exception:                                       # noqa: BLE001
+            return
+        d.text = txt
+        d.modified = (txt != d.saved_text)
+
+    def _poll_dirty(self):
+        """定时检查有没有改动，给标签加 * 号。
+
+        用"文本和上次保存的内容比对"，而不是挂 Monaco 的 onDidChangeModelContent——
+        因为切标签时的 set_text 也会触发那个事件，结果一切换就变成"已修改"。
+        """
+        if self._switching or self.cur < 0:
+            return
+        if self.worker is not None and self.worker.isRunning():
+            return
+        if self.run_worker is not None and self.run_worker.isRunning():
+            return
+        d = self._doc()
+        if d is None:
+            return
+        try:
+            txt = _norm_text(self.editor.text())
+        except Exception:                                       # noqa: BLE001
+            return
+        if txt == d.text:
+            return
+        d.text = txt
+        was = d.modified
+        d.modified = (txt != d.saved_text)
+        if d.modified != was:
+            self._sync_tabs()
+
+    def _push_current_to_editor(self, d, remember_marks=True):
+        """把一个文档的内容灌进编辑器。"""
+        self._switching = True
+        try:
+            self.editor.set_text(d.text)
+            self.editor.clear_marks()
+            if remember_marks and d.marks:
+                self.editor.mark_errors(d.marks)
+            # 没改动过的文档：把基线校正成编辑器实际返回的文本。
+            # 编辑器可能对内容做归一化（比如换行符），不校正的话一打开就是"已修改"。
+            if not d.modified:
+                txt = _norm_text(self.editor.text())
+                if txt:
+                    d.text = txt
+                    d.saved_text = txt
+            for i, (_, code) in enumerate(ENCODINGS):
+                if code == d.encoding:
+                    self.cmb_enc.blockSignals(True)
+                    self.cmb_enc.setCurrentIndex(i)
+                    self.cmb_enc.blockSignals(False)
+                    break
+        finally:
+            self._switching = False
+
+    def _activate(self, index: int):
+        """切换到第 index 个文档。"""
+        if not (0 <= index < len(self.docs)) or index == self.cur:
+            self._sync_tabs()
+            return
+        self._flush()                    # 先保存当前这个
+        self.cur = index
+        d = self.docs[index]
+        self._push_current_to_editor(d)
+        self._last_report = None         # 换了文件，上一份讲解别串过来
+        self._explanation_html = self._empty_html()
+        self._apply_view()
+        self._sync_tabs()
+        self._save_session()             # 切过标签就记一下，程序异常退出也不至于丢
+
+    def _open_doc(self, doc: "Doc", activate=True):
+        """新开一个文档标签。已经打开过的文件直接跳过去，不重复开。"""
+        if doc.path:
+            target = os.path.normcase(os.path.abspath(doc.path))
+            for i, d in enumerate(self.docs):
+                if d.path and os.path.normcase(os.path.abspath(d.path)) == target:
+                    if activate:
+                        self._activate(i)
+                    return
+        self._flush()
+        self.docs.append(doc)
+        if activate:
+            self.cur = len(self.docs) - 1
+            self._push_current_to_editor(doc)
+            self._last_report = None
+            self._explanation_html = self._empty_html()
+            self._apply_view()
+        self._sync_tabs()
+        self._save_session()
+
+    def _close_doc(self, index: int):
+        """关掉一个标签；有未保存改动就先问。"""
+        if not (0 <= index < len(self.docs)):
+            return
+        if index == self.cur:
+            self._flush()
+        d = self.docs[index]
+        if not self._confirm_discard(d):
+            return
+        del self.docs[index]
+        if not self.docs:
+            self.cur = -1
+            self._load_sample()          # 全关了就给一个示例，不留空白界面
+            return
+        if index < self.cur or self.cur >= len(self.docs):
+            self.cur = max(0, min(self.cur, len(self.docs) - 1))
+        if index <= self.cur:
+            self.cur = min(self.cur, len(self.docs) - 1)
+        self._push_current_to_editor(self.docs[self.cur])
+        self._sync_tabs()
+        self._save_session()
+
+    def _confirm_discard(self, d) -> bool:
+        """有未保存改动时询问。返回 True 表示"可以继续（已存或已放弃）"。"""
+        if not d.modified:
+            return True
+        name = d.title().lstrip("* ")
+        box = QMessageBox(self)
+        box.setWindowTitle("还没保存")
+        box.setIcon(QMessageBox.Warning)
+        box.setText("《%s》有改动还没保存。" % name)
+        box.setInformativeText("要先保存吗？不保存的话，这些改动会丢掉。")
+        b_save = box.addButton("保存", QMessageBox.AcceptRole)
+        b_drop = box.addButton("不保存", QMessageBox.DestructiveRole)
+        b_cancel = box.addButton("取消", QMessageBox.RejectRole)
+        box.setDefaultButton(b_save)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is b_cancel:
+            return False
+        if clicked is b_save:
+            return self._save_doc(d)
+        return True
+
+    def _save_doc(self, d) -> bool:
+        """保存指定文档。返回是否成功（取消也算失败，用来中止关闭流程）。"""
+        target = d.path
+        if not target:
+            suggested = os.path.join(self._projects_dir(), "untitled.c")
+            target, _ = QFileDialog.getSaveFileName(self, "保存为", suggested, "C 源文件 (*.c)")
+            if not target:
+                return False
+        try:
+            with open(target, "w", encoding=d.encoding, newline="\n") as f:
+                f.write(d.text)
+        except (OSError, LookupError) as e:
+            QMessageBox.warning(self, "保存失败", str(e))
+            return False
+        d.path = target
+        d.saved_text = d.text
+        d.modified = False
+        self._sync_tabs()
+        return True
+
+    def closeEvent(self, event):
+        """退出前逐个询问未保存的文档，然后把进度记下来。
+
+        这是最容易丢东西的地方：学生写了一半直接点右上角 X，
+        如果不问，那一整段代码就没了。
+
+        注意顺序：**先问、再存会话**。如果用户在某一步点了「取消」，
+        直接 return，会话保持原样，不留半截状态。
+        选了「不保存」的文档，文本仍然会进会话——下次打开还在，
+        标签上依然带 * 号，等于"关了程序但没丢东西"。
+        """
+        for d in list(self.docs):
+            if d is self._doc():
+                self._flush()
+            if not self._confirm_discard(d):
+                event.ignore()
+                return
+        self._save_session()
+        try:
+            self._dirty_timer.stop()
+        except Exception:                                       # noqa: BLE001
+            pass
+        event.accept()
 
     def _check_completion_status(self):
         def done(info):
@@ -428,10 +739,15 @@ class MainWindow(QMainWindow):
         bar = QHBoxLayout()
         # 工具栏只留"每次都要点"的按钮。
         # 打开/帮助等命令只保留菜单一个入口 —— 之前两处都有，是重复的。
-        self.btn_new = QPushButton("新建项目")
-        self.btn_new.setToolTip("新建项目文件夹并设置存放位置（Ctrl+N）")
+        self.btn_new = QPushButton("新建文件")
+        self.btn_new.setToolTip("新建一个 .c 文件并选择存放位置（Ctrl+N）")
         self.btn_save = QPushButton("保存")
         self.btn_save.setToolTip("保存当前文件（Ctrl+S）")
+        self.btn_align = QPushButton("对齐")
+        self.btn_align.setToolTip(
+            "把缩进整理规范（Ctrl+Shift+F）。\n"
+            "只改行首缩进和行尾空格，**不会动你的代码内容**；\n"
+            "按 Ctrl+Shift+Z 可以撤回到对齐前。")
         self.btn_check = QPushButton("检查 (F5)")
         self.btn_check.setDefault(True)
         self.btn_run = QPushButton("运行 (F9)")
@@ -461,6 +777,7 @@ class MainWindow(QMainWindow):
 
         bar.addWidget(self.btn_new)
         bar.addWidget(self.btn_save)
+        bar.addWidget(self.btn_align)
         bar.addSpacing(12)
         bar.addWidget(self.btn_check)
         bar.addWidget(self.btn_run)
@@ -473,7 +790,20 @@ class MainWindow(QMainWindow):
         bar.addWidget(self.cmb_enc)
         layout.addLayout(bar)
 
-        self.lbl_file = QLabel("未命名")
+        # 标签栏：一个标签 = 一个打开的文件（可以来自不同项目）
+        self.tabbar = QTabBar()
+        self.tabbar.setTabsClosable(True)
+        self.tabbar.setMovable(True)
+        self.tabbar.setExpanding(False)
+        self.tabbar.setDrawBase(False)
+        self.tabbar.setElideMode(Qt.ElideRight)
+        self.tabbar.setUsesScrollButtons(True)
+        self.tabbar.setToolTip("点标签切换文件；× 关闭当前标签")
+        self.tabbar.currentChanged.connect(self._on_tab_changed)
+        self.tabbar.tabCloseRequested.connect(self._close_doc)
+        layout.addWidget(self.tabbar)
+
+        self.lbl_file = QLabel("")
         self.lbl_file.setStyleSheet("color:#4B5563;")
         layout.addWidget(self.lbl_file)
 
@@ -517,7 +847,7 @@ class MainWindow(QMainWindow):
         self.status = self.statusBar()
         self.status.showMessage(self.editor.note)
 
-        act_new = QAction("新建项目…", self)
+        act_new = QAction("新建文件…", self)
         act_new.setShortcut("Ctrl+N")
         act_new.triggered.connect(self.new_project)
         act_open = QAction("打开…", self)
@@ -533,6 +863,17 @@ class MainWindow(QMainWindow):
         act_save_as = QAction("另存为…", self)
         act_save_as.setShortcut("Ctrl+Shift+S")
         act_save_as.triggered.connect(lambda: self.save_file(force_dialog=True))
+        act_align = QAction("对齐（整理缩进）", self)
+        act_align.setShortcut("Ctrl+Shift+F")
+        act_align.triggered.connect(self.format_code)
+        act_align_undo = QAction("撤回到对齐前", self)
+        act_align_undo.setShortcut("Ctrl+Shift+Z")
+        act_align_undo.triggered.connect(self.undo_format)
+        act_close = QAction("关闭当前标签", self)
+        act_close.setShortcut("Ctrl+W")
+        act_close.triggered.connect(self.close_current)
+        act_sample = QAction("新建示例标签", self)
+        act_sample.triggered.connect(self._load_sample)
         act_where = QAction("设置项目存放位置…", self)
         act_where.triggered.connect(self.set_projects_dir)
         act_check = QAction("检查", self)
@@ -547,6 +888,7 @@ class MainWindow(QMainWindow):
         self.btn_run.clicked.connect(self.do_run)
         self.btn_new.clicked.connect(self.new_project)
         self.btn_save.clicked.connect(self.save_file)
+        self.btn_align.clicked.connect(self.format_code)
         self.btn_check.clicked.connect(self.do_check)
         # Ctrl+加号/减号/0 缩放：学生看代码看累了想放大，是很自然的诉求。
         #
@@ -575,12 +917,16 @@ class MainWindow(QMainWindow):
         m = self.menuBar().addMenu("文件")
         m.addAction(act_new)
         m.addAction(act_open)
+        m.addAction(act_sample)
         m.addSeparator()
         m.addAction(act_save)
         m.addAction(act_save_as)
         m.addSeparator()
+        m.addAction(act_align)
+        m.addAction(act_align_undo)
+        m.addSeparator()
+        m.addAction(act_close)
         m.addAction(act_where)
-        m.addAction("载入示例", self._load_sample)
         m.addSeparator()
         m.addAction("退出", self.close)
 
@@ -639,6 +985,13 @@ class MainWindow(QMainWindow):
             '<li>本地知识库优先，命中时<b>不联网、不花钱</b></li>'
             '<li>行号与位置<b>只来自编译器</b>，不由模型编造</li>'
             '</ul>'
+            '<p><b>同时开好几个文件：</b>打开或新建的文件都会出现在上面的标签栏里，'
+            '点标签切换、点 × 关闭（<b>Ctrl+W</b>）。可以一边开着作业、一边开着练习。</p>'
+            '<p><b>关掉程序也不会丢：</b>下次打开会<b>自动回到上次那几个文件和那个标签</b>，'
+            '连你<b>没保存的改动</b>都还在（标签上带 * 号，提醒你还没存盘）。</p>'
+            '<p><b>缩进乱了？</b>点工具栏 <b>「对齐」</b>（<b>Ctrl+Shift+F</b>）会把缩进整理规范。'
+            '它<b>只改行首缩进和行尾空格，不动你的代码内容</b>；'
+            '整理完按 <b>Ctrl+Shift+Z</b> 可以退回去。</p>'
             '<p><b>运行怎么用：</b>按 <b>F9</b> 会开一个系统命令行窗口来运行程序，'
             '这样 <code>scanf</code> 可以真正交互输入；'
             '想不弹窗、直接在下面看输出，用 <b>Shift+F9</b>。</p>'
@@ -646,7 +999,7 @@ class MainWindow(QMainWindow):
             '<b>Ctrl+0</b> 恢复默认；也可以按住 <b>Ctrl</b> 滚滚轮。字号会记住。</p>'
             '<p style="color:#6B7280;font-size:10pt;">你的原文件不会被修改；'
             '检查和运行用的都是工作副本。<br>'
-            '看完按 <b>F1</b> 收起说明，把位置让给讲解。</p></div>')
+            '有没保存的改动时，关标签和退出都会先问你一句。</p></div>')
 
     def _empty_html(self) -> str:
         return (
@@ -772,37 +1125,166 @@ class MainWindow(QMainWindow):
 
     # ---------- 文件 ----------
     def _load_sample(self):
-        self.editor.set_text(SAMPLE)
-        self.editor.clear_marks()
-        self.path = None
-        self.lbl_file.setText("未命名（示例代码，含一个全角分号错误）")
+        """载入示例作为**新的标签**（而不是覆盖当前文件）。"""
+        doc = Doc(path=None, encoding="mbcs", text=SAMPLE,
+                  label="示例（含全角分号错误）")
+        self._open_doc(doc)
+
+    def _on_tab_changed(self, index: int):
+        if self._switching or index < 0:
+            return
+        self._activate(index)
 
     def open_file(self):
-        p, _ = QFileDialog.getOpenFileName(self, "打开 C 源文件", self._projects_dir(),
-                                           "C 源文件 (*.c *.h);;所有文件 (*.*)")
-        if not p:
-            return
-        self._open_path(p)
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "打开 C 源文件", self._projects_dir(),
+            "C 源文件 (*.c *.h);;所有文件 (*.*)")
+        for p in paths or []:
+            self._open_path(p)
 
     def save_file(self, force_dialog: bool = False):
-        """保存。force_dialog=True 时强制弹「另存为」。"""
-        target = None if force_dialog else self.path
-        if not target:
-            suggested = self.path or "untitled.c"
-            target, _ = QFileDialog.getSaveFileName(self, "保存为", suggested, "C 源文件 (*.c)")
-            if not target:
-                return
-        enc = self.cmb_enc.currentData()
-        try:
-            with open(target, "w", encoding=enc, newline="\n") as f:
-                f.write(self.editor.text())
-        except (OSError, LookupError) as e:
-            QMessageBox.warning(self, "保存失败", str(e))
+        """保存当前文档。force_dialog=True 时强制弹「另存为」。"""
+        d = self._doc()
+        if d is None:
             return
-        self.path = target
-        self.encoding = enc
-        self.lbl_file.setText("%s　（%s）" % (target, encoding_label(enc)))
-        self.status.showMessage("已保存：%s" % target, 4000)
+        self._flush()
+        if force_dialog:
+            old = d.path
+            d.path = None
+            if not self._save_doc(d):
+                d.path = old
+                return
+        elif not self._save_doc(d):
+            return
+        self.status.showMessage("已保存：%s" % (d.path or ""), 4000)
+
+    def close_current(self):
+        if self.cur >= 0:
+            self._close_doc(self.cur)
+
+    # ---------- 上次进度（会话） ----------
+    def _session_snapshot(self):
+        """把当前所有标签整理成可保存的普通字典。"""
+        out = []
+        for d in self.docs:
+            out.append({
+                "path": d.path or "",
+                "encoding": d.encoding,
+                "label": d.label,
+                "text": d.text if d.modified else "",
+                "modified": bool(d.modified),
+            })
+        return out
+
+    def _save_session(self):
+        """把当前进度写进用户目录。失败不影响使用，只是下次从示例开始。"""
+        if getattr(self, "_restoring", False):
+            return
+        try:
+            self._flush()
+            session_mod.save(self._session_snapshot(), self.cur)
+        except Exception:                                       # noqa: BLE001
+            pass
+
+    def _restore_session(self) -> bool:
+        """恢复上次的标签。返回 True 表示确实恢复了东西。"""
+        try:
+            data = session_mod.load()
+        except Exception:                                       # noqa: BLE001
+            return False
+        items = data.get("docs") or []
+        if not items:
+            return False
+        restored = 0
+        for it in items:
+            path = it.get("path") or ""
+            stored = it.get("text") or ""
+            enc = it.get("encoding") or "mbcs"
+            if path and os.path.exists(path):
+                try:
+                    with open(path, "rb") as f:
+                        raw = f.read()
+                except OSError:
+                    continue
+                disk = raw.decode(enc, errors="replace")
+                disk = _norm_text(disk)
+                text = stored or disk
+                doc = Doc(path=path, encoding=enc, text=text, label=it.get("label") or "未命名")
+                doc.saved_text = disk
+                doc.modified = (text != disk)
+            elif path:
+                continue                                   # 文件被删了/移走了，跳过
+            elif stored:
+                # 从没保存过的文档：内容只在会话里
+                doc = Doc(path=None, encoding=enc, text=stored,
+                          label=it.get("label") or "未命名")
+                doc.saved_text = ""
+                doc.modified = True
+            else:
+                continue
+            self.docs.append(doc)
+            restored += 1
+        if not restored:
+            self.docs = []
+            return False
+        try:
+            active = int(data.get("active") or 0)
+        except (TypeError, ValueError):
+            active = 0
+        self.cur = max(0, min(active, len(self.docs) - 1))
+        self._switching = True
+        try:
+            self._push_current_to_editor(self.docs[self.cur])
+        finally:
+            self._switching = False
+        self._sync_tabs()
+        return True
+
+    # ---------- 对齐（整理缩进） ----------
+    def format_code(self):
+        """把当前文件的缩进整理规范。
+
+        安全性：engine.format 只改行首缩进和行尾空白，并且自带一道
+        "去掉所有空白后内容必须完全一致"的校验。格式化后仍然记下原文，
+        按 Ctrl+Shift+Z 可以一步撤回——因为 Monaco 的 set_text 会清空它自己的撤销栈。
+        """
+        d = self._doc()
+        if d is None:
+            return
+        self._flush()
+        before = _norm_text(self.editor.text())
+        try:
+            after, changed = format_mod.format_c_source(before)
+        except Exception as e:                                  # noqa: BLE001
+            QMessageBox.warning(self, "对齐失败", "%s: %s" % (type(e).__name__, e))
+            return
+        if not changed or after == before:
+            self.status.showMessage("缩进已经对齐了，没有需要改的地方", 6000)
+            return
+        d.format_undo = before
+        self._switching = True
+        try:
+            self.editor.set_text(after)
+        finally:
+            self._switching = False
+        self._flush()
+        self.status.showMessage(
+            "已对齐 %d 行（Ctrl+Shift+Z 可撤回到对齐前）" % changed, 9000)
+
+    def undo_format(self):
+        """撤回到对齐前的样子。"""
+        d = self._doc()
+        if d is None or not d.format_undo:
+            self.status.showMessage("没有可撤回的对齐操作", 4000)
+            return
+        self._switching = True
+        try:
+            self.editor.set_text(d.format_undo)
+        finally:
+            self._switching = False
+        d.format_undo = None
+        self._flush()
+        self.status.showMessage("已恢复到对齐前的样子", 6000)
 
     # ---------- 项目 ----------
     def _projects_dir(self) -> str:
@@ -813,7 +1295,7 @@ class MainWindow(QMainWindow):
         return d or newproject_mod.default_projects_dir()
 
     def set_projects_dir(self):
-        """设置以后新建项目默认放哪儿。"""
+        """设置以后新建文件默认放哪儿。"""
         cur = self._projects_dir()
         p = QFileDialog.getExistingDirectory(self, "选择项目默认存放位置", cur)
         if not p:
@@ -823,12 +1305,12 @@ class MainWindow(QMainWindow):
         except Exception as e:                                  # noqa: BLE001
             QMessageBox.warning(self, "保存失败", str(e))
             return
-        self.status.showMessage("以后新建项目默认放在：%s" % p, 6000)
+        self.status.showMessage("以后新建文件默认放在：%s" % p, 6000)
         QMessageBox.information(self, "已设置",
-                                "以后「新建项目」默认放在：\n%s" % p)
+                                "以后「新建文件」默认放在：\n%s" % p)
 
     def new_project(self):
-        """新建项目：一个文件夹 + 一个 main.c，然后直接在编辑器里打开。"""
+        """新建文件：在选定目录里创建一个 .c（扁平存放，不再套文件夹），然后直接打开。"""
         dlg = newproject_mod.NewProjectDialog(self, self._projects_dir(),
                                               self.cmb_enc.currentData())
         # 坑：QDialog.Accepted 是**类属性**，写成 dlg.Accepted（实例）在 PySide6 下会
@@ -841,29 +1323,28 @@ class MainWindow(QMainWindow):
         except Exception:                                       # noqa: BLE001
             pass
         self._open_path(dlg.result_path)
-        self.status.showMessage("已创建项目：%s" % dlg.result_path, 8000)
+        self.status.showMessage("已创建：%s" % dlg.result_path, 8000)
 
     def _open_path(self, path: str):
-        """把某个文件读进编辑器（不弹文件选择框）。"""
+        """把某个文件作为新标签打开（不弹文件选择框）。已经开过的会直接跳过去。"""
         try:
             enc, _lines = read_source(path)
             with open(path, "rb") as f:
-                text = f.read().decode(enc, errors="replace")
+                text = f.read().decode(enc, errors="replace").replace("\r\n", "\n")
         except OSError as e:
             QMessageBox.warning(self, "打开失败", str(e))
             return
-        self.path = path
-        self.encoding = enc
-        self.editor.clear_marks()
-        for i, (_, code) in enumerate(ENCODINGS):
-            if code == enc:
-                self.cmb_enc.setCurrentIndex(i)
-                break
-        self.editor.set_text(text.replace("\r\n", "\n"))
-        self.lbl_file.setText("%s　（%s）" % (path, encoding_label(enc)))
+        self._open_doc(Doc(path=path, encoding=enc, text=text))
 
     def _encoding_changed(self):
-        self.encoding = self.cmb_enc.currentData()
+        """编码下拉框是**当前文档**的属性，切了标签要跟着变。"""
+        if self._switching:
+            return
+        d = self._doc()
+        if d is None:
+            return
+        d.encoding = self.cmb_enc.currentData()
+        self._update_file_label()
 
     # ---------- 检查 ----------
     def _working_copy(self) -> str:
@@ -872,8 +1353,10 @@ class MainWindow(QMainWindow):
         base = os.path.basename(self.path) if self.path else "untitled.c"
         if not base.lower().endswith((".c", ".h")):
             base += ".c"
-        out = os.path.join(d, base)
-        enc = self.cmb_enc.currentData()
+        # 前面加文档编号：同时打开两个项目时，两边可能都有 main.c，
+        # 不加编号就会互相覆盖，检查结果串到另一个文件上去。
+        out = os.path.join(d, "%02d_%s" % (max(self.cur, 0), base))
+        enc = self.encoding
         try:
             data = self.editor.text().encode(enc, errors="replace")
         except LookupError:
@@ -908,7 +1391,7 @@ class MainWindow(QMainWindow):
         if self.worker is not None and self.worker.isRunning():
             return
         working = self._working_copy()
-        enc = self.cmb_enc.currentData()
+        enc = self.encoding
         self.status.showMessage("正在编译…")
         self.btn_run.setEnabled(False)
         self.btn_check.setEnabled(False)

@@ -1,18 +1,22 @@
 # -*- coding: utf-8 -*-
-"""新建项目对话框。
+"""新建文件对话框。
 
-需求是"新建项目，然后设置存储路径"，所以一个对话框里同时给出：
-  · 项目名
-  · 存放位置（可浏览、可记住上次用的位置）
-  · 起始模板
+需求演进过一轮：
+  一开始是"新建项目 → 一个文件夹 + 里面的 main.c"；
+  后来改成**扁平存放**——文件直接放在你选的目录里，不再套一层同名文件夹。
 
-设计取舍：不做"解决方案/工程文件"那一套。这是给初学者看报错用的工具，
-一个项目 = 一个文件夹 + 一个 main.c，学生能直接在资源管理器里找到、能拷给老师。
-多余的概念只会增加负担。
+为什么改：学生打开资源管理器只看到
+    ctutor项目 / 第一次作业 / main.c
+要进两层才找到自己那份代码，交作业还得再点进去。而"项目"这个概念
+对刚学 C 的人来说也没有任何额外用处——**他们需要的就是一个 .c 文件**。
+
+所以现在：
+    ctutor项目 / 第一次作业.c
+一眼看到、直接发微信、直接拷给老师。
 """
 import os
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt                                        # noqa: F401
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox,
                                QFileDialog, QFormLayout, QHBoxLayout, QLabel,
                                QLineEdit, QMessageBox, QPushButton, QVBoxLayout)
@@ -62,7 +66,7 @@ _BAD_CHARS = '\\/:*?"<>|'
 
 
 def default_projects_dir() -> str:
-    """默认的存放位置：文档\\ctutor项目。"""
+    """默认的存放位置：文档\\ctutor项目（文件直接放这里面，不再分子文件夹）。"""
     home = os.path.expanduser("~")
     for name in ("Documents", "文档"):
         p = os.path.join(home, name)
@@ -71,36 +75,50 @@ def default_projects_dir() -> str:
     return os.path.join(home, "ctutor项目")
 
 
+def strip_c_ext(name: str) -> str:
+    """把用户输入的 .c/.h 后缀去掉，统一由程序补。避免出现 作业1.c.c。"""
+    n = (name or "").strip()
+    low = n.lower()
+    for ext in (".c", ".h"):
+        if low.endswith(ext):
+            return n[: -len(ext)]
+    return n
+
+
 def validate_name(name: str):
     """返回 (是否合法, 原因)。"""
-    name = (name or "").strip()
-    if not name:
-        return False, "项目名不能为空"
+    name = strip_c_ext(name)
+    if not name.strip():
+        return False, "文件名不能为空"
     if name in (".", ".."):
         return False, "这个名字不能用"
     for ch in _BAD_CHARS:
         if ch in name:
-            return False, "项目名里不能有这些字符：%s" % _BAD_CHARS
+            return False, "文件名里不能有这些字符：%s" % _BAD_CHARS
     if name.endswith(".") or name.endswith(" "):
-        return False, "项目名不能以点或空格结尾（Windows 会存不住）"
+        return False, "文件名不能以点或空格结尾（Windows 会存不住）"
     return True, ""
 
 
 class NewProjectDialog(QDialog):
-    """新建项目。返回的 result_path 是最终要打开的 .c 文件绝对路径。"""
+    """新建文件。返回的 result_path 是最终要打开的 .c 文件绝对路径。
+
+    类名保留 NewProjectDialog 是为了不破坏已有的导入与测试；
+    实际语义已经变成"新建文件"。
+    """
 
     def __init__(self, parent=None, default_dir: str = "", default_encoding: str = "mbcs"):
         super().__init__(parent)
-        self.setWindowTitle("新建项目")
+        self.setWindowTitle("新建文件")
         self.result_path = ""
         self.projects_dir = default_dir or default_projects_dir()
         self.encoding = default_encoding
 
         form = QFormLayout()
-        self.ed_name = QLineEdit("myproject")
+        self.ed_name = QLineEdit("作业1")
         self.ed_name.setPlaceholderText("英文或中文都行，例如：第一次作业")
         self.ed_name.selectAll()
-        form.addRow("项目名：", self.ed_name)
+        form.addRow("文件名：", self.ed_name)
 
         row = QHBoxLayout()
         self.ed_dir = QLineEdit(self.projects_dir)
@@ -114,7 +132,7 @@ class NewProjectDialog(QDialog):
         for label, _slug, _body in TEMPLATES:
             self.cmb_tpl.addItem(label)
         self.cmb_tpl.setCurrentIndex(1)          # 默认 Hello World
-        form.addRow("起始模板：", self.cmb_tpl)
+        form.addRow("起始内容：", self.cmb_tpl)
 
         self.chk_open = QCheckBox("创建后立即打开")
         self.chk_open.setChecked(True)
@@ -146,50 +164,51 @@ class NewProjectDialog(QDialog):
         if p:
             self.ed_dir.setText(p)
 
+    def planned_path(self) -> str:
+        name = strip_c_ext(self.ed_name.text().strip()) or "…"
+        return os.path.join(self.ed_dir.text().strip() or "…", name + ".c")
+
     def _refresh_preview(self):
-        name = self.ed_name.text().strip() or "…"
-        path = os.path.join(self.ed_dir.text().strip() or "…", name)
         ok, why = validate_name(self.ed_name.text())
         if ok:
-            self.lbl_preview.setText("将创建：%s\\main.c" % path)
+            self.lbl_preview.setText("将创建：%s" % self.planned_path())
             self.lbl_preview.setStyleSheet("color:#4B5563;")
         else:
-            self.lbl_preview.setText("项目名有问题：%s" % why)
+            self.lbl_preview.setText("文件名有问题：%s" % why)
             self.lbl_preview.setStyleSheet("color:#B91C1C;")
 
     def _accept(self):
         ok, why = validate_name(self.ed_name.text())
         if not ok:
-            QMessageBox.warning(self, "项目名不对", why)
+            QMessageBox.warning(self, "文件名不对", why)
             return
-        name = self.ed_name.text().strip()
         base = self.ed_dir.text().strip()
         if not base:
             QMessageBox.warning(self, "缺少位置", "请选择存放位置。")
             return
-        folder = os.path.join(base, name)
-        main_c = os.path.join(folder, "main.c")
+        name = strip_c_ext(self.ed_name.text().strip())
+        target = os.path.join(base, name + ".c")
 
-        if os.path.exists(main_c):
+        if os.path.exists(target):
             # 不覆盖别人的东西：问清楚再说
             r = QMessageBox.question(
                 self, "文件已存在",
-                "%s 已经存在。\n\n要覆盖它吗？" % main_c,
+                "%s 已经存在。\n\n要覆盖它吗？" % target,
                 QMessageBox.Yes | QMessageBox.No)
             if r != QMessageBox.Yes:
                 return
         try:
-            os.makedirs(folder, exist_ok=True)
+            os.makedirs(base, exist_ok=True)
             _idx, _slug, body = TEMPLATES[self.cmb_tpl.currentIndex()]
-            with open(main_c, "w", encoding=self.encoding, errors="replace",
+            with open(target, "w", encoding=self.encoding, errors="replace",
                       newline="\n") as f:
                 f.write(body)
         except OSError as e:
-            QMessageBox.critical(self, "创建失败", "没能创建项目：\n%s" % e)
+            QMessageBox.critical(self, "创建失败", "没能创建文件：\n%s" % e)
             return
 
         self.projects_dir = base
-        self.result_path = main_c
+        self.result_path = target
         self.accept()
 
     # ---------------------------------------------------------------- 供测试
@@ -197,3 +216,7 @@ class NewProjectDialog(QDialog):
         """给测试用：不弹窗，直接按当前输入创建。"""
         self._accept()
         return self.result_path
+
+
+# 语义别名
+NewFileDialog = NewProjectDialog
