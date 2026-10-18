@@ -208,13 +208,36 @@ check("事件日志为 JSONL（每行一个 json 对象）",
       os.path.exists(log_path) and isinstance(
           json.loads(open(log_path, encoding="utf-8").readlines()[-1]), dict))
 
+# 关键回归：面板走的 check_once 必须自己写日志。
+#
+# 踩过的坑：日志原来只写在 cli.py 里，而面板调用的是 check_once，
+# 于是"用面板（主要使用方式）时待补清单永远是空的"。
+# 更糟的是这个 bug 被 try/except: pass 吞了很久没被发现。
+# 所以这里直接验证"跑一次 check_once 就多一条日志"。
+print()
+print("— ⑤b 面板共用路径也会写日志（回归：曾因 report.py 忘了 import os 而静默失败）—")
+try:
+    from engine import report as report_mod
+    config_mod.ensure_dirs(cfg_log)
+    _n0 = len(open(log_path, encoding="utf-8").readlines()) if os.path.exists(log_path) else 0
+    _src = os.path.join(ROOT, "tests", "cases", "01_missing_semicolon.c")
+    report_mod.check_once(_src, depth=4)
+    _n1 = len(open(log_path, encoding="utf-8").readlines()) if os.path.exists(log_path) else 0
+    check("check_once（面板路径）会写入事件日志", _n1 > _n0, (_n0, _n1))
+    _errlog = os.path.join(config_mod.path_of("log", cfg_log), "jsonlog_error.log")
+    check("写日志过程没有静默报错（否则会留下 jsonlog_error.log）",
+          not os.path.exists(_errlog),
+          open(_errlog, encoding="utf-8").read()[:300] if os.path.exists(_errlog) else "")
+except Exception as e:                                          # noqa: BLE001
+    check("check_once 会写入事件日志", False, "调用失败：%s" % e)
+
 # 清理测试写入的日志，避免污染真实统计
 try:
     for name in ("ctutor.jsonl", "unmatched.jsonl"):
         p = os.path.join(config_mod.path_of("log", cfg_log), name)
         if os.path.exists(p):
             lines = [l for l in open(p, encoding="utf-8") if "C9999" not in l
-                     and "test_event" not in l]
+                     and "test_event" not in l and "01_missing_semicolon.c" not in l]
             open(p, "w", encoding="utf-8").writelines(lines)
 except OSError:
     pass

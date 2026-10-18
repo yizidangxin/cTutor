@@ -11,11 +11,31 @@
 import os
 import subprocess
 import sys
+import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 sys.path.insert(0, ROOT)
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+# 把配置与会话都指到临时目录：测试必须是**干净起点**。
+# 加了"上次进度"之后，窗口启动会恢复上一次的标签——如果不隔离，
+# 前一个窗口关掉时写下的会话会被后一个窗口读回去，测试就不再可重复。
+_TEST_DIR = tempfile.mkdtemp(prefix="ctutor_panel_cfg_")
+from engine import config as _config_mod                      # noqa: E402
+from engine import session as _session_mod                    # noqa: E402
+_config_mod.user_config_path = lambda: os.path.join(_TEST_DIR, "config.json")
+
+
+def _clear_session():
+    """删掉会话文件，让下一个窗口从示例开始。"""
+    try:
+        p = _session_mod.session_path()
+        if os.path.exists(p):
+            os.remove(p)
+    except OSError:
+        pass
+
 
 results = []
 
@@ -130,6 +150,7 @@ import time                                              # noqa: E402
 
 from engine import report as report_mod                  # noqa: E402
 
+_clear_session()
 win = panel.MainWindow()
 win.resize(1100, 760)
 win.show()
@@ -237,6 +258,7 @@ class _FakeEditor:
         self.revealed = line
 
 
+_clear_session()
 win2 = panel.MainWindow()
 app.processEvents()
 fake = _FakeEditor()
@@ -264,6 +286,7 @@ print()
 print("— 运行功能 —")
 from engine import run as run_mod                        # noqa: E402
 
+_clear_session()
 win3 = panel.MainWindow()
 app.processEvents()
 check("有「运行」按钮", hasattr(win3, "btn_run") and "运行" in win3.btn_run.text())
@@ -440,9 +463,13 @@ check("缩放收进了「视图」菜单（原先错放在「检查」菜单里�
 check("「运行」菜单同时提供系统命令行与面板内两种方式",
       any("系统命令行" in t for t in run_menu) and any("面板内" in t for t in run_menu),
       run_menu)
-check("文件菜单有新建项目与设置存放位置",
-      any("新建项目" in t for t in menu_items("文件"))
+check("文件菜单有新建文件与设置存放位置",
+      any("新建文件" in t for t in menu_items("文件"))
       and any("存放位置" in t for t in menu_items("文件")),
+      menu_items("文件"))
+check("文件菜单有对齐与撤回对齐",
+      any("对齐" in t for t in menu_items("文件"))
+      and any("撤回" in t for t in menu_items("文件")),
       menu_items("文件"))
 
 print()
@@ -462,9 +489,11 @@ dlg = NewProjectDialog(win3, tmp, "utf-8")
 dlg.ed_name.setText("测试项目")
 dlg.cmb_tpl.setCurrentIndex(1)               # Hello World
 created = dlg.create_only()
-check("能创建项目文件夹与 main.c",
-      bool(created) and created.endswith(os.path.join("测试项目", "main.c"))
+check("能创建 <目录>/<名字>.c（扁平存放，不套同名文件夹）",
+      bool(created) and created == os.path.join(tmp, "测试项目.c")
       and os.path.exists(created), created)
+check("没有生成同名文件夹（改版前的行为）",
+      not os.path.isdir(os.path.join(tmp, "测试项目")), os.path.join(tmp, "测试项目"))
 check("模板内容写进去了",
       "Hello, World!" in open(created, encoding="utf-8").read())
 
@@ -504,10 +533,245 @@ finally:
     panel.newproject_mod.NewProjectDialog = _orig_cls
 app.processEvents()
 check("new_project() 全流程能走通（不抛异常）", True)
-check("new_project() 之后编辑器里就是新项目",
-      bool(win3.path) and win3.path.endswith("main.c") and "自动项目" in win3.path,
+check("new_project() 之后编辑器里就是新文件",
+      bool(win3.path) and win3.path.endswith(".c") and "自动项目" in win3.path
+      and not os.path.isdir(os.path.dirname(win3.path).rstrip("\\") + os.sep + "自动项目"),
       win3.path)
 check("new_project() 之后标红被清空", win3.editor.monaco or True)
+
+# ---------------------------------------------------------------- 多标签 / 未保存提示
+print()
+print("— 多标签：同时打开多个项目 —")
+_clear_session()
+win4 = panel.MainWindow()
+app.processEvents()
+for _ in range(20):
+    app.processEvents()
+    time.sleep(0.05)
+
+check("有标签栏", hasattr(win4, "tabbar") and win4.tabbar.count() >= 1,
+      getattr(win4, "tabbar", None))
+check("标签可以关闭（有关闭按钮）", win4.tabbar.tabsClosable())
+
+docs_dir = os.path.join(ROOT, "build", "mdoc")
+os.makedirs(os.path.join(docs_dir, "p1"), exist_ok=True)
+os.makedirs(os.path.join(docs_dir, "p2"), exist_ok=True)
+f1 = os.path.join(docs_dir, "p1", "main.c")
+f2 = os.path.join(docs_dir, "p2", "main.c")
+with open(f1, "w", encoding="utf-8", newline="\n") as f:
+    f.write("int main(void){ int a = 1 return 0; }\n")   # p1 有语法错误
+with open(f2, "w", encoding="utf-8", newline="\n") as f:
+    f.write("int main(void){ return 0; }\n")             # p2 正常
+
+_n0 = win4.tabbar.count()
+win4._open_path(f1)
+win4._open_path(f2)
+app.processEvents()
+check("打开两个文件后标签数 +2", win4.tabbar.count() == _n0 + 2, win4.tabbar.count())
+check("当前文档是最后打开的那个", win4.path == f2, win4.path)
+
+# 同一个文件重复打开不该再开一个标签
+win4._open_path(f1)
+app.processEvents()
+check("重复打开同一文件会跳过去，不重复开标签",
+      win4.tabbar.count() == _n0 + 2 and win4.path == f1, win4.tabbar.count())
+
+# 切标签内容不能串
+win4.tabbar.setCurrentIndex(_n0 + 1)          # 切到 p2
+app.processEvents()
+check("切到 p2 后编辑器里是 p2 的内容", 'printf' not in win4.editor.text()
+      and "return 0" in win4.editor.text(), win4.editor.text()[:40])
+win4.tabbar.setCurrentIndex(_n0)              # 切回 p1
+app.processEvents()
+check("切回 p1 后编辑器里是 p1 的内容", "int a = 1" in win4.editor.text(),
+      win4.editor.text()[:40])
+check("两个项目的 main.c 工作副本不互相覆盖",
+      win4._working_copy().endswith(os.path.join("panel", "%02d_main.c" % win4.cur))
+      or ("%02d_" % win4.cur) in os.path.basename(win4._working_copy()),
+      os.path.basename(win4._working_copy()))
+
+print()
+print("— 未保存提示 —")
+_d = win4._doc()
+check("刚打开的文档不算已修改（否则退出时会白问一遍）", _d.modified is False,
+      _d.modified)
+check("没有改动时不会弹框（_confirm_discard 直接放行）",
+      win4._confirm_discard(_d) is True)
+
+# 模拟用户编辑
+win4.editor.set_text(win4.editor.text().replace("int a = 1", "int a = 2"))
+for _ in range(25):
+    app.processEvents()
+    time.sleep(0.05)
+check("编辑后标记为已修改", _d.modified is True, _d.modified)
+check("已修改的标签标题带 * 号", win4.tabbar.tabText(win4.cur).startswith("* "),
+      win4.tabbar.tabText(win4.cur))
+
+# closeEvent：用户点「取消」应当拦住退出
+_orig_confirm = win4._confirm_discard
+win4._confirm_discard = lambda doc: False
+class _Ev:
+    def __init__(self): self.ignored = False; self.accepted = False
+    def ignore(self): self.ignored = True
+    def accept(self): self.accepted = True
+_ev = _Ev()
+win4.closeEvent(_ev)
+check("有未保存改动且用户点取消时，退出会被拦住", _ev.ignored and not _ev.accepted)
+
+# 用户点「不保存」→ 放行
+win4._confirm_discard = lambda doc: True
+_ev2 = _Ev()
+win4.closeEvent(_ev2)
+check("用户选择不保存时，退出继续", _ev2.accepted)
+win4._confirm_discard = _orig_confirm
+
+# 清理：把改动抹掉，避免真的退出时弹框
+for _doc in win4.docs:
+    _doc.saved_text = _doc.text
+    _doc.modified = False
+win4._dirty_timer.stop()
+win4.close()
+
+# ---------------------------------------------------------------- 对齐（整理缩进）
+print()
+print("— 对齐：整理缩进 —")
+_clear_session()
+win5 = panel.MainWindow()
+app.processEvents()
+for _ in range(20):
+    app.processEvents()
+    time.sleep(0.05)
+
+check("工具栏有「对齐」按钮", hasattr(win5, "btn_align"),
+      getattr(win5, "btn_align", None))
+
+messy = ("#include <stdio.h>\n"
+         "int main(void) {\n"
+         "int a, b;\n"
+         "if (a > b) {\n"
+         "printf(\"{ 这是字符串里的括号 }\\n\");\n"
+         "}\n"
+         "return 0;\n"
+         "}\n")
+fmt_path = os.path.join(ROOT, "build", "mdoc", "fmt_demo.c")
+os.makedirs(os.path.dirname(fmt_path), exist_ok=True)
+with open(fmt_path, "w", encoding="utf-8", newline="\n") as f:
+    f.write(messy)
+win5._open_path(fmt_path)
+for _ in range(10):
+    app.processEvents()
+    time.sleep(0.05)
+
+win5.format_code()
+for _ in range(15):
+    app.processEvents()
+    time.sleep(0.05)
+_formatted = win5.editor.text().replace("\r\n", "\n")
+check("对齐后按大括号缩进", "    int a, b;" in _formatted, _formatted)
+check("对齐只动空白，代码内容一字未变",
+      "".join(_formatted.split()) == "".join(messy.split()), _formatted)
+check("字符串里的花括号没被当成块", "    if (a > b) {" in _formatted, _formatted)
+check("对齐后标记为已修改（退出时会问要不要存）", win5._doc().modified is True)
+check("对齐后可以撤回", bool(win5._doc().format_undo))
+
+win5.undo_format()
+for _ in range(15):
+    app.processEvents()
+    time.sleep(0.05)
+check("撤回到对齐前", win5.editor.text().replace("\r\n", "\n") == messy,
+      win5.editor.text())
+
+win5.format_code()
+for _ in range(15):
+    app.processEvents()
+    time.sleep(0.05)
+_before2 = win5.editor.text()
+win5.format_code()          # 再点一次：已规范，不该再改
+for _ in range(10):
+    app.processEvents()
+    time.sleep(0.05)
+check("已经对齐过的内容再点一次不会变（幂等）",
+      win5.editor.text() == _before2)
+
+for _doc in win5.docs:
+    _doc.saved_text = _doc.text
+    _doc.modified = False
+win5._dirty_timer.stop()
+win5.close()
+
+# ---------------------------------------------------------------- 上次进度
+print()
+print("— 上次进度：关掉再打开，接着写 —")
+_clear_session()
+win6 = panel.MainWindow()
+app.processEvents()
+for _ in range(20):
+    app.processEvents()
+    time.sleep(0.05)
+
+_p1 = os.path.join(ROOT, "build", "mdoc", "sess_a.c")
+_p2 = os.path.join(ROOT, "build", "mdoc", "sess_b.c")
+with open(_p1, "w", encoding="utf-8", newline="\n") as f:
+    f.write("int main(void){ return 0; }\n")
+with open(_p2, "w", encoding="utf-8", newline="\n") as f:
+    f.write("int main(void){ return 1; }\n")
+win6._open_path(_p1)
+win6._open_path(_p2)
+app.processEvents()
+for _ in range(10):
+    app.processEvents()
+    time.sleep(0.05)
+
+# 在第二个文件里改点东西但不保存
+win6.editor.set_text(win6.editor.text() + "/* 写到一半 */\n")
+for _ in range(20):
+    app.processEvents()
+    time.sleep(0.05)
+check("改动被识别", win6._doc().modified is True)
+win6._save_session()
+app.processEvents()
+check("会话文件已写出", os.path.exists(_session_mod.session_path()))
+
+# 模拟"关掉程序再打开"：新建一个窗口，应该恢复上次的标签
+win7 = panel.MainWindow()
+app.processEvents()
+for _ in range(25):
+    app.processEvents()
+    time.sleep(0.05)
+check("重新打开后恢复了上次的文件（不用重新找）",
+      win7.tabbar.count() >= 2, win7.tabbar.count())
+_paths = [os.path.normcase(os.path.abspath(d.path)) for d in win7.docs if d.path]
+check("恢复出来的文件路径对得上",
+      os.path.normcase(os.path.abspath(_p1)) in _paths
+      and os.path.normcase(os.path.abspath(_p2)) in _paths, _paths)
+_cur = win7._doc()
+check("恢复后停在关掉前那个标签", _cur is not None and _cur.path == _p2,
+      _cur.path if _cur else None)
+check("没保存的改动也跟着回来了（这段代码没白写）",
+      "写到一半" in (win7.editor.text() or ""), (win7.editor.text() or "")[-40:])
+check("恢复后的未保存内容仍然标着已修改（不会被误当成已存盘）",
+      win7._doc().modified is True)
+
+# 文件被删掉之后，恢复时应该跳过而不是崩
+os.remove(_p2)
+win7._save_session()
+app.processEvents()
+win8 = panel.MainWindow()
+app.processEvents()
+for _ in range(20):
+    app.processEvents()
+    time.sleep(0.05)
+check("会话里的文件被删了 → 跳过它，程序照常打开",
+      win8._doc() is not None, win8.tabbar.count())
+
+for _w in (win6, win7, win8):
+    for _doc in _w.docs:
+        _doc.saved_text = _doc.text
+        _doc.modified = False
+    _w._dirty_timer.stop()
+    _w.close()
+_clear_session()
+
 win3.close()
 
 # ---------------------------------------------------------------- 桌面启动器
