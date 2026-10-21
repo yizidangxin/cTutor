@@ -30,14 +30,17 @@ for _stream in (sys.stdout, sys.stderr):
     except Exception:                                           # noqa: BLE001
         pass
 
-from PySide6.QtCore import Qt, QEvent, QThread, QTimer, Signal            # noqa: E402
+from PySide6.QtCore import (Qt, QEvent, QEasingCurve, QObject,        # noqa: E402
+                            QPropertyAnimation, QThread, QTimer, Signal)
 from PySide6.QtGui import QAction, QFont, QFontDatabase, QKeySequence  # noqa: E402
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox,   # noqa: E402
-                               QDialog, QFileDialog, QHBoxLayout, QInputDialog, QLabel,
-                               QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit,
-                               QPushButton, QSpinBox, QSplitter, QTabBar, QTabWidget,
+                               QDialog, QDialogButtonBox, QFileDialog, QHBoxLayout,
+                               QInputDialog, QLabel, QLineEdit, QMainWindow,
+                               QMessageBox, QPlainTextEdit, QPushButton, QRadioButton,
+                               QSpinBox, QSplitter, QTabBar, QTabWidget,
                                QTextBrowser, QVBoxLayout, QWidget)
 from engine import ai as ai_mod                                     # noqa: E402
+from engine import ai_fix as ai_fix_mod                             # noqa: E402
 from engine import completion as completion_mod                     # noqa: E402
 from engine import config as config_mod                             # noqa: E402
 from engine import compilers as compilers_mod                       # noqa: E402
@@ -393,7 +396,7 @@ class Doc:
     """
 
     __slots__ = ("path", "encoding", "text", "saved_text", "label", "modified",
-                 "marks", "format_undo")
+                 "marks", "format_undo", "compare_old", "compare_new")
 
     def __init__(self, path=None, encoding="mbcs", text="", label="未命名"):
         self.path = path
@@ -403,7 +406,9 @@ class Doc:
         self.label = label
         self.modified = False
         self.marks = []          # 切回来时恢复上一轮的标红
-        self.format_undo = None  # 对齐之前的文本（一步撤销用）
+        self.format_undo = None  # 上一次"整体改写"之前的文本（对齐 / AI 修改共用）
+        self.compare_old = ""    # AI 修改前
+        self.compare_new = ""    # AI 修改后
 
     def title(self) -> str:
         base = os.path.basename(self.path) if self.path else self.label
@@ -413,6 +418,300 @@ class Doc:
         if self.path:
             return "%s\n（%s）" % (self.path, encoding_label(self.encoding))
         return "还没保存到文件"
+
+
+class AIFixWorker(QThread):
+    """后台线程：让模型给一份修正后的完整代码。
+
+    单独开线程的原因和检查一样：网络往返几秒到十几秒，卡在 UI 线程会假死。
+    """
+    done = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, diag, source, code_context, parent=None):
+        super().__init__(parent)
+        self.diag = diag
+        self.source = source
+        self.code_context = code_context
+
+    def run(self):
+        try:
+            res = ai_fix_mod.request_fix(self.diag, self.source, self.code_context)
+            self.done.emit(res)
+        except Exception:                                           # noqa: BLE001
+            self.failed.emit(traceback.format_exc())
+
+
+class AIFixModeDialog(QDialog):
+    """先问清楚：AI 改完之后，你想怎么对照？
+
+    三种方式各有各的用处，所以每次让用户选，而不是替他决定：
+      · 原位修改 + 对照按钮 —— 改完直接看到结果，想对比再点按钮
+      · 独立窗口          —— 左边原代码右边新代码，可以拖窗口并排看
+      · 行内注释          —— 不动原代码，只在问题行下面加一行 // AI 建议
+    """
+
+    MODES = [
+        ("inplace", "直接在原文里改，改完用「对照」按钮比一比",
+         "最省地方。标签会带 * 号提醒你还没存盘；不满意可以一键还原。"),
+        ("window", "另开一个窗口显示正确代码，两个窗口并排对照",
+         "原代码一个字都不动，看完再决定要不要应用。窗口可以随意拖动、缩放。"),
+        ("inline", "在出问题的那一行下面加一行 // AI 建议",
+         "原代码不动，只是加注释。适合想自己动手改、只要个提示的时候。"),
+    ]
+
+    def __init__(self, parent=None, current="inplace"):
+        super().__init__(parent)
+        self.setWindowTitle("AI 修改 — 选择对照方式")
+        self.resize(620, 380)
+        self.mode = current or "inplace"
+        lay = QVBoxLayout(self)
+        tip = QLabel("AI 会按这个代码给你一份修正版本。先选你想怎么看改了什么：")
+        tip.setWordWrap(True)
+        lay.addWidget(tip)
+
+        self._radios = []
+        for key, title, desc in self.MODES:
+            row = QVBoxLayout()
+            rd = QRadioButton(title)
+            rd.setStyleSheet("font-weight:600;")
+            row.addWidget(rd)
+            d = QLabel("　　" + desc)
+            d.setStyleSheet("color:#4B5563;font-size:10pt;")
+            d.setWordWrap(True)
+            row.addWidget(d)
+            box = QWidget()
+            box.setLayout(row)
+            lay.addWidget(box)
+            self._radios.append((key, rd))
+            if key == self.mode:
+                rd.setChecked(True)
+        if not any(rd.isChecked() for _k, rd in self._radios):
+            self._radios[0][1].setChecked(True)
+
+        self.chk_remember = QCheckBox("记住这个选择，以后不再问")
+        lay.addWidget(self.chk_remember)
+        lay.addStretch(1)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Ok).setText("开始修改")
+        buttons.button(QDialogButtonBox.Cancel).setText("取消")
+        buttons.accepted.connect(self._accept)
+        buttons.rejected.connect(self.reject)
+        lay.addWidget(buttons)
+
+    def _accept(self):
+        for key, rd in self._radios:
+            if rd.isChecked():
+                self.mode = key
+                break
+        self.accept()
+
+    def remember(self) -> bool:
+        return self.chk_remember.isChecked()
+
+
+class DiffDialog(QDialog):
+    """原代码 / 新代码的行级对照。"""
+
+    def __init__(self, parent=None, old="", new="", title="对照：改了什么"):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setWindowFlag(Qt.WindowContextHelpButtonHint, False)
+        self.resize(900, 700)
+
+        add, dele = ai_fix_mod.diff_stats(old, new)
+        rows = ai_fix_mod.diff_lines(old, new)
+        body = []
+        lno = 0
+        for tag, text in rows:
+            lno += 1
+            esc = html.escape(text).replace(" ", "&nbsp;")
+            if tag == "add":
+                body.append('<div style="background:#DCFCE7;">'
+                            '<span style="color:#15803D;">+ </span>%s</div>' % esc)
+            elif tag == "del":
+                body.append('<div style="background:#FEE2E2;">'
+                            '<span style="color:#B91C1C;">- </span>%s</div>' % esc)
+            else:
+                body.append('<div><span style="color:#9CA3AF;">  </span>%s</div>' % esc)
+        doc = (
+            '<div style="font-family:\'Consolas\',\'Microsoft YaHei\',monospace;'
+            'font-size:11pt;line-height:1.5;white-space:pre;">'
+            '<p style="font-family:\'Microsoft YaHei\',sans-serif;">'
+            '绿色是新增，红色是删掉的，灰色是没动的。'
+            '　<span style="color:#15803D;">+%d 行</span>　'
+            '<span style="color:#B91C1C;">-%d 行</span></p>'
+            '%s</div>' % (add, dele, "".join(body))
+        )
+        self.view = QTextBrowser()
+        self.view.setStyleSheet("QTextBrowser{background:#FFFFFF;border:1px solid #dde3ea;}")
+        self.view.setHtml(doc)
+        lay = QVBoxLayout(self)
+        lay.addWidget(self.view, 1)
+
+
+class FixedCodeWindow(QDialog):
+    """独立窗口：显示 AI 给的正确代码，可拖动可缩放，看完再决定要不要应用。
+
+    刻意做成**非模态**（show 而不是 exec）：这样学生可以一边看这个窗口里的代码，
+    一边在原窗口里改，或者拖开并排对照。
+    """
+
+    applied = Signal()
+
+    def __init__(self, parent=None, code="", changes=None, summary=""):
+        super().__init__(parent)
+        self.setWindowTitle("AI 给的正确代码")
+        self.setWindowFlag(Qt.WindowContextHelpButtonHint, False)
+        self.resize(820, 640)
+        self._code = code
+        lay = QVBoxLayout(self)
+
+        head = QLabel(summary or "下面是 AI 修正后的完整代码。原文件没有任何改动。")
+        head.setWordWrap(True)
+        head.setStyleSheet("color:#374151;")
+        lay.addWidget(head)
+
+        if changes:
+            items = []
+            for ch in changes[:8]:
+                bits = []
+                if ch.get("before") and ch.get("after"):
+                    bits.append("%s → %s" % (ch.get("before"), ch.get("after")))
+                elif ch.get("after"):
+                    bits.append(ch.get("after"))
+                if ch.get("why"):
+                    bits.append(ch.get("why"))
+                if bits:
+                    items.append("第 %s 行：%s" % (ch.get("line") or "?", "；".join(bits)))
+            if items:
+                info = QLabel("改了这些：\n" + "\n".join("· " + it for it in items))
+                info.setWordWrap(True)
+                info.setStyleSheet("color:#4B5563;font-size:10pt;")
+                lay.addWidget(info)
+
+        self.view = QPlainTextEdit()
+        self.view.setReadOnly(True)
+        self.view.setPlainText(code)
+        self.view.setStyleSheet(
+            "QPlainTextEdit{font-family:'Consolas','Microsoft YaHei',monospace;"
+            "font-size:11pt;background:#FCFCFD;}")
+        lay.addWidget(self.view, 1)
+
+        row = QHBoxLayout()
+        btn_copy = QPushButton("复制全部")
+        btn_copy.clicked.connect(lambda: QApplication.clipboard().setText(self._code))
+        btn_apply = QPushButton("应用到编辑器")
+        btn_apply.setDefault(True)
+        btn_apply.clicked.connect(self._apply)
+        btn_close = QPushButton("关闭")
+        btn_close.clicked.connect(self.accept)
+        row.addWidget(btn_copy)
+        row.addStretch(1)
+        row.addWidget(btn_apply)
+        row.addWidget(btn_close)
+        lay.addLayout(row)
+
+    def _apply(self):
+        self.applied.emit()
+        self.accept()
+
+
+# ---------------------------------------------------------------- 平滑滚动
+class SmoothScroller(QObject):
+    """把 QTextBrowser 的滚轮滚动变成短动画。
+
+    原生滚轮是"一格一跳"（约三行），看长讲解时视觉很跳，尤其是读到一半
+    被打断后很难找回位置。这里拦下滚轮事件，改成对滚动条做 160ms 缓动。
+
+    只接管 wheel 事件：键盘翻页、拖动滚动条、点链接都不受影响。
+    连续滚滚轮时目标位置会累加，不会互相打断。
+    """
+
+    def __init__(self, view, duration: int = 150, ratio: float = 0.16):
+        super().__init__(view)
+        self.view = view
+        self.ratio = ratio
+        self._target = None
+        self._anim = QPropertyAnimation(view.verticalScrollBar(), b"value", self)
+        self._anim.setDuration(duration)
+        self._anim.setEasingCurve(QEasingCurve.OutCubic)
+        self._anim.finished.connect(self._on_finished)
+        try:
+            view.viewport().installEventFilter(self)
+        except Exception:                                       # noqa: BLE001
+            pass
+
+    def _on_finished(self):
+        self._target = None
+
+    def reset(self):
+        """换内容之前调用：停掉动画，否则新页面会被旧动画拽着跑。"""
+        try:
+            self._anim.stop()
+        except Exception:                                       # noqa: BLE001
+            pass
+        self._target = None
+
+    def eventFilter(self, obj, ev):
+        if ev.type() != QEvent.Wheel:
+            return False
+        try:
+            if obj is not self.view.viewport():
+                return False
+            sb = self.view.verticalScrollBar()
+            if sb.maximum() <= sb.minimum():
+                return False
+            delta = ev.angleDelta().y()
+            if not delta:
+                return False
+            unit = max(24, int(self.view.viewport().height() * self.ratio))
+            start = self._target if self._target is not None else sb.value()
+            target = start - int(delta / 120.0 * unit)
+            target = max(sb.minimum(), min(sb.maximum(), target))
+            if target == sb.value() and self._target is None:
+                return False
+            self._target = target
+            self._anim.stop()
+            self._anim.setStartValue(sb.value())
+            self._anim.setEndValue(target)
+            self._anim.start()
+            return True
+        except Exception:                                       # noqa: BLE001
+            return False
+
+
+# ---------------------------------------------------------------- 使用说明窗口
+class HelpDialog(QDialog):
+    """独立的使用说明窗口。
+
+    为什么从「讲解栏」里搬出来：
+      以前按 F1 是把讲解栏的内容临时换成说明。问题是——
+        · 说明和讲解抢同一块地方，看说明时看不到刚才的讲解；
+        · 按检查时又要把说明收起来，用户会以为"按了没反应"；
+        · 说明里有很多条目，塞在下半屏里要滚很久。
+      改成独立窗口后：说明可以一直开着对照着操作，讲解栏只讲报错。
+    """
+
+    def __init__(self, parent=None, html=""):
+        super().__init__(parent)
+        self.setWindowTitle("使用说明")
+        self.setWindowFlag(Qt.WindowContextHelpButtonHint, False)
+        self.resize(780, 660)
+        self.view = QTextBrowser()
+        self.view.setOpenExternalLinks(True)
+        self.view.setStyleSheet("QTextBrowser{background:#FFFFFF;border:1px solid #dde3ea;}")
+        self.view.setHtml(html)
+        btn = QPushButton("知道了，关闭")
+        btn.setDefault(True)
+        btn.clicked.connect(self.accept)
+        row = QHBoxLayout()
+        row.addStretch(1)
+        row.addWidget(btn)
+        lay = QVBoxLayout(self)
+        lay.addWidget(self.view, 1)
+        lay.addLayout(row)
 
 
 # ---------------------------------------------------------------- 主窗口
@@ -435,7 +734,12 @@ class MainWindow(QMainWindow):
         self.editor = EditorAdapter()
         self.worker = None
         self.run_worker = None
+        self.ai_worker = None                # AI 修改的后台线程
+        self._ai_fix_pending = False
+        self._ai_fix_mode = "inplace"
+        self._fixed_win = None
         self._explanation_html = ""          # 最近一次的讲解（供「帮助」关闭后恢复）
+        self._help_win = None                # 使用说明独立窗口（懒创建）
         self._zoom = 0                       # 相对默认字号的缩放步数
         self._restoring = True               # 恢复会话期间不要回写会话
         self._build_ui()
@@ -465,6 +769,12 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(1200, self._apply_zoom)
         # 补全脚本在页面加载后异步注册，稍等一下再查询状态
         QTimer.singleShot(1500, self._check_completion_status)
+        # 第一次使用：自动弹一次使用说明；之后不再打扰（记在用户配置里）
+        try:
+            if not bool((config_mod.load().get("ui") or {}).get("help_shown")):
+                QTimer.singleShot(900, self._show_help_first_time)
+        except Exception:                                       # noqa: BLE001
+            pass
 
     # ---------- 当前文档（保留 self.path / self.encoding 的旧写法） ----------
     def _doc(self):
@@ -514,6 +824,7 @@ class MainWindow(QMainWindow):
                 self.tabbar.setCurrentIndex(self.cur)
             self.tabbar.blockSignals(False)
             self._update_file_label()
+            self._sync_compare_button()
         finally:
             self._switching = False
 
@@ -651,26 +962,49 @@ class MainWindow(QMainWindow):
         self._save_session()
 
     def _confirm_discard(self, d) -> bool:
-        """有未保存改动时询问。返回 True 表示"可以继续（已存或已放弃）"。"""
+        """有未保存改动时询问单个文档。返回 True 表示"可以继续"。"""
         if not d.modified:
             return True
-        name = d.title().lstrip("* ")
+        return self._confirm_close_all([d], title="还没保存", ask_cancel=True) != "cancel"
+
+    def _confirm_close_all(self, docs, title="还没保存", ask_cancel=True) -> str:
+        """一次问完所有未保存的文档，而不是每个弹一个框。
+
+        为什么改：以前是"每个文件一个模态框"。同时开 4 个文件、每个都改过，
+        关程序就要连点 4 次；中间手一抖点了「取消」，整个关闭被中止，
+        用户以为程序卡住了或者丢了东西，往往直接强制结束——**那才会真的丢**。
+
+        现在只弹一次，列出所有未保存的文件，给三个选择：
+        全部保存 / 全部不保存 / 取消。
+        """
+        todo = [d for d in docs if d.modified]
+        if not todo:
+            return "save"
+        names = [d.title().lstrip("* ") for d in todo]
         box = QMessageBox(self)
-        box.setWindowTitle("还没保存")
+        box.setWindowTitle(title)
         box.setIcon(QMessageBox.Warning)
-        box.setText("《%s》有改动还没保存。" % name)
-        box.setInformativeText("要先保存吗？不保存的话，这些改动会丢掉。")
-        b_save = box.addButton("保存", QMessageBox.AcceptRole)
-        b_drop = box.addButton("不保存", QMessageBox.DestructiveRole)
-        b_cancel = box.addButton("取消", QMessageBox.RejectRole)
+        if len(todo) == 1:
+            box.setText("《%s》有改动还没保存。" % names[0])
+            box.setInformativeText("要先保存吗？不保存的话这些改动只会留在「上次进度」里。")
+        else:
+            box.setText("有 %d 个文件改了还没保存：" % len(todo))
+            shown = names[:8]
+            more = "" if len(names) <= 8 else "\n……还有 %d 个" % (len(names) - 8)
+            box.setInformativeText("\n".join("· " + n for n in shown) + more +
+                                   "\n\n不保存的话，改动只会留在「上次进度」里，"
+                                   "下次打开还能接着改。")
+        b_save = box.addButton("全部保存" if len(todo) > 1 else "保存",
+                               QMessageBox.AcceptRole)
+        b_drop = box.addButton("全部不保存" if len(todo) > 1 else "不保存",
+                               QMessageBox.DestructiveRole)
+        b_cancel = box.addButton("取消", QMessageBox.RejectRole) if ask_cancel else None
         box.setDefaultButton(b_save)
         box.exec()
         clicked = box.clickedButton()
-        if clicked is b_cancel:
-            return False
-        if clicked is b_save:
-            return self._save_doc(d)
-        return True
+        if b_cancel is not None and clicked is b_cancel:
+            return "cancel"
+        return "drop" if (b_drop is not None and clicked is b_drop) else "save"
 
     def _save_doc(self, d) -> bool:
         """保存指定文档。返回是否成功（取消也算失败，用来中止关闭流程）。"""
@@ -692,24 +1026,36 @@ class MainWindow(QMainWindow):
         self._sync_tabs()
         return True
 
-    def closeEvent(self, event):
-        """退出前逐个询问未保存的文档，然后把进度记下来。
-
-        这是最容易丢东西的地方：学生写了一半直接点右上角 X，
-        如果不问，那一整段代码就没了。
-
-        注意顺序：**先问、再存会话**。如果用户在某一步点了「取消」，
-        直接 return，会话保持原样，不留半截状态。
-        选了「不保存」的文档，文本仍然会进会话——下次打开还在，
-        标签上依然带 * 号，等于"关了程序但没丢东西"。
-        """
+    def _save_all(self) -> bool:
+        """保存所有有改动的文档。任一失败返回 False。"""
+        ok = True
         for d in list(self.docs):
             if d is self._doc():
                 self._flush()
-            if not self._confirm_discard(d):
-                event.ignore()
+            if d.modified and not self._save_doc(d):
+                ok = False
+        return ok
+
+    def closeEvent(self, event):
+        """退出前问一次未保存的改动，然后把**全部**打开的文件记下来。
+
+        顺序很关键：**先把会话写下去，再弹询问框**。
+        因为用户可能在询问框上点「取消」、或者干脆强制结束进程；
+        先存的话，无论后面发生什么，"上次进度"都是完整的，
+        下次打开仍然是所有文件都在。
+        """
+        if self._doc() is not None:
+            self._flush()
+        self._save_session()             # 先落盘，再问
+        choice = self._confirm_close_all(list(self.docs), title="退出前确认")
+        if choice == "cancel":
+            event.ignore()
+            return
+        if choice == "save":
+            if not self._save_all():
+                event.ignore()           # 有文件存不下来（比如被占用），别静默退出
                 return
-        self._save_session()
+            self._save_session()         # 保存后改动已清零，刷新一次会话
         try:
             self._dirty_timer.stop()
         except Exception:                                       # noqa: BLE001
@@ -727,7 +1073,15 @@ class MainWindow(QMainWindow):
                                         % info.get("error", ""), 10000)
             else:
                 self.status.showMessage(self.editor.note, 5000)
-        self.editor.probe_completion(done)
+        # 编辑器可能被替换成没有补全能力的实现（测试替身 / 降级编辑器），
+        # 这里不能假定方法一定存在，否则定时器回调会抛异常刷一屏红字。
+        probe = getattr(self.editor, "probe_completion", None)
+        if probe is None:
+            return
+        try:
+            probe(done)
+        except Exception:                                       # noqa: BLE001
+            pass
 
     # ---------- 界面 ----------
     def _build_ui(self):
@@ -748,6 +1102,14 @@ class MainWindow(QMainWindow):
             "把缩进整理规范（Ctrl+Shift+F）。\n"
             "只改行首缩进和行尾空格，**不会动你的代码内容**；\n"
             "按 Ctrl+Shift+Z 可以撤回到对齐前。")
+        self.btn_ai_fix = QPushButton("AI 修改")
+        self.btn_ai_fix.setToolTip(
+            "让 AI 给一份**能编译通过**的修正代码（Ctrl+Shift+A）。\n"
+            "会先问你用哪种方式对照：原文里改 / 另开窗口 / 只在行下加注释。\n"
+            "改动只进编辑器，不会自动保存到你的文件。")
+        self.btn_compare = QPushButton("对照")
+        self.btn_compare.setToolTip("和 AI 修改之前的版本逐行对照")
+        self.btn_compare.setEnabled(False)
         self.btn_check = QPushButton("检查 (F5)")
         self.btn_check.setDefault(True)
         self.btn_run = QPushButton("运行 (F9)")
@@ -778,6 +1140,8 @@ class MainWindow(QMainWindow):
         bar.addWidget(self.btn_new)
         bar.addWidget(self.btn_save)
         bar.addWidget(self.btn_align)
+        bar.addWidget(self.btn_ai_fix)
+        bar.addWidget(self.btn_compare)
         bar.addSpacing(12)
         bar.addWidget(self.btn_check)
         bar.addWidget(self.btn_run)
@@ -837,6 +1201,9 @@ class MainWindow(QMainWindow):
             "QTextBrowser{background:#FFFFFF;border:1px solid #dde3ea;}")
         rl.addWidget(self.view_run, 1)
         self.tabs.addTab(run_page, "运行输出")
+        # 讲解栏和运行输出都装上平滑滚动（滚轮变成短动画，读长内容不跳）
+        self._scrollers = [SmoothScroller(self.view), SmoothScroller(self.view_run)]
+        self._last_html = None
         # 缩放的事件过滤器挂在 QApplication 上（见 __init__），
         # 这样无论焦点在编辑器还是输出区都能生效。
         splitter.addWidget(self.tabs)
@@ -869,6 +1236,12 @@ class MainWindow(QMainWindow):
         act_align_undo = QAction("撤回到对齐前", self)
         act_align_undo.setShortcut("Ctrl+Shift+Z")
         act_align_undo.triggered.connect(self.undo_format)
+        act_ai_fix = QAction("AI 修改代码…", self)
+        act_ai_fix.setShortcut("Ctrl+Shift+A")
+        act_ai_fix.triggered.connect(self.do_ai_fix)
+        act_compare = QAction("和 AI 修改前对照", self)
+        act_compare.setShortcut("Ctrl+Shift+D")
+        act_compare.triggered.connect(self.show_ai_compare)
         act_close = QAction("关闭当前标签", self)
         act_close.setShortcut("Ctrl+W")
         act_close.triggered.connect(self.close_current)
@@ -889,6 +1262,8 @@ class MainWindow(QMainWindow):
         self.btn_new.clicked.connect(self.new_project)
         self.btn_save.clicked.connect(self.save_file)
         self.btn_align.clicked.connect(self.format_code)
+        self.btn_ai_fix.clicked.connect(self.do_ai_fix)
+        self.btn_compare.clicked.connect(self.show_ai_compare)
         self.btn_check.clicked.connect(self.do_check)
         # Ctrl+加号/减号/0 缩放：学生看代码看累了想放大，是很自然的诉求。
         #
@@ -925,6 +1300,9 @@ class MainWindow(QMainWindow):
         m.addAction(act_align)
         m.addAction(act_align_undo)
         m.addSeparator()
+        m.addAction(act_ai_fix)
+        m.addAction(act_compare)
+        m.addSeparator()
         m.addAction(act_close)
         m.addAction(act_where)
         m.addSeparator()
@@ -942,12 +1320,12 @@ class MainWindow(QMainWindow):
         m_view.addAction(act_zoom_reset)
 
         m3 = self.menuBar().addMenu("帮助")
-        # 唯一的「使用说明」入口（工具栏那个重复按钮已删除），F1 仍可用
+        # 「使用说明」现在打开独立窗口，不再占用讲解栏
         self.act_help = QAction("使用说明", self)
         self.act_help.setCheckable(True)
-        self.act_help.setChecked(True)
+        self.act_help.setChecked(False)
         self.act_help.setShortcut("F1")
-        self.act_help.toggled.connect(self._apply_view)
+        self.act_help.triggered.connect(self.toggle_help)
         m3.addAction(self.act_help)
 
         m4 = self.menuBar().addMenu("AI")
@@ -975,7 +1353,8 @@ class MainWindow(QMainWindow):
         return (
             '<div style="font-family:\'Microsoft YaHei\',sans-serif;font-size:11pt;'
             'color:#374151;line-height:1.8;">'
-            '<p><b>这是一个「帮你看懂编译报错」的工具，它不会替你改代码。</b></p>'
+            '<p><b>这是一个「帮你看懂编译报错」的工具。</b>'
+            '默认只讲解、不替你改代码；想要改好的版本，得自己点「AI 修改」。</p>'
             '<p>用法：把 C 代码贴进上面的编辑区，按 <b>F5</b> 或点「检查」。</p>'
             '<ul>'
             '<li><b>输入前几个字母就会有候选</b>——例如打 <code>pri</code> 选 printf，'
@@ -989,17 +1368,32 @@ class MainWindow(QMainWindow):
             '点标签切换、点 × 关闭（<b>Ctrl+W</b>）。可以一边开着作业、一边开着练习。</p>'
             '<p><b>关掉程序也不会丢：</b>下次打开会<b>自动回到上次那几个文件和那个标签</b>，'
             '连你<b>没保存的改动</b>都还在（标签上带 * 号，提醒你还没存盘）。</p>'
+            '<p><b>想让 AI 直接给出改好的代码？</b>点工具栏 <b>「AI 修改」</b>'
+            '（<b>Ctrl+Shift+A</b>）。它会先问你想怎么看改了什么，有三种：</p>'
+            '<ul>'
+            '<li><b>原位修改</b>：直接改在编辑器里，改完点 <b>「对照」</b> 比一比</li>'
+            '<li><b>独立窗口</b>：另开一个窗口放正确代码，可以拖开并排对照，原文件不动</li>'
+            '<li><b>行内注释</b>：不动代码，只在出问题那一行下面加一行 <code>// AI 建议</code></li>'
+            '</ul>'
+            '<p style="color:#6B7280;font-size:10pt;">AI 改完<b>不会自动保存</b>，'
+            '标签会变成未保存状态；按 <b>Ctrl+Shift+Z</b> 随时可以还原。</p>'
             '<p><b>缩进乱了？</b>点工具栏 <b>「对齐」</b>（<b>Ctrl+Shift+F</b>）会把缩进整理规范。'
             '它<b>只改行首缩进和行尾空格，不动你的代码内容</b>；'
             '整理完按 <b>Ctrl+Shift+Z</b> 可以退回去。</p>'
             '<p><b>运行怎么用：</b>按 <b>F9</b> 会开一个系统命令行窗口来运行程序，'
             '这样 <code>scanf</code> 可以真正交互输入；'
             '想不弹窗、直接在下面看输出，用 <b>Shift+F9</b>。</p>'
+            '<p><b>常用头文件：</b>打 <code>inc</code> 会出现 <code>include</code> 片段，'
+            '下拉里可以选 stdio / stdlib / string / math / <b>time</b> / ctype；'
+            '这些库的常用函数（<code>time</code>、<code>ctime</code>、'
+            '<code>isalpha</code>、<code>toupper</code>、<code>memset</code> 等）'
+            '也都做成了补全候选，选中就有中文说明。</p>'
             '<p><b>字号太小看不清？</b>按 <b>Ctrl+=</b> 放大、<b>Ctrl+-</b> 缩小、'
             '<b>Ctrl+0</b> 恢复默认；也可以按住 <b>Ctrl</b> 滚滚轮。字号会记住。</p>'
-            '<p style="color:#6B7280;font-size:10pt;">你的原文件不会被修改；'
-            '检查和运行用的都是工作副本。<br>'
-            '有没保存的改动时，关标签和退出都会先问你一句。</p></div>')
+            '<p style="color:#6B7280;font-size:10pt;">检查和运行用的都是工作副本，'
+            '不会动你的源文件。<br>'
+            '有没保存的改动时，关标签和退出都会先问你一句（一次问完所有文件）。<br>'
+            '这个窗口再点一次「使用说明」或按 <b>F1</b> 就会关掉。</p></div>')
 
     def _empty_html(self) -> str:
         return (
@@ -1011,14 +1405,58 @@ class MainWindow(QMainWindow):
             '或菜单「帮助 → 使用说明」。</span>'
             '</div>')
 
-    def _apply_view(self):
-        """按「使用说明」的开关状态，决定下方面板显示说明还是讲解。
+    def _apply_view(self, keep_scroll: bool = False):
+        """讲解栏只显示讲解。使用说明已经搬到独立窗口（见 toggle_help）。
 
-        原来同时存在一个工具栏「帮助」按钮和菜单项，两边还要互相同步状态——
-        纯粹的重复。现在只留菜单项一个入口。
+        「丝滑」体现在两个细节：
+          · 内容没变就不重设 HTML —— 重设会让滚动条瞬间归零，看着"闪一下"；
+          · 改讲深层数这类**内容换但位置该保留**的场景，记住原来的滚动位置。
         """
-        show_help = self.act_help.isChecked()
-        self.view.setHtml(self._help_html() if show_help else self._explanation_html)
+        html_text = self._explanation_html or self._empty_html()
+        if html_text == getattr(self, "_last_html", None):
+            return
+        self._last_html = html_text
+        sb = self.view.verticalScrollBar()
+        pos = sb.value() if keep_scroll else 0
+        for sc in getattr(self, "_scrollers", []):
+            sc.reset()
+        self.view.setHtml(html_text)
+        if keep_scroll and pos > 0:
+            sb.setValue(min(pos, sb.maximum()))
+
+    # ---------- 使用说明（独立窗口） ----------
+    def show_help(self):
+        """打开说明窗口（已经开着就置前，**不会关掉它**）。
+
+        和 toggle_help 分开是有原因的：第一次启动时的自动弹出用这个。
+        如果那里用 toggle，而用户恰好在那一瞬间自己点开了说明，
+        定时器一到就会把刚打开的窗口关掉——用户会觉得"点了没反应"。
+        """
+        if self._help_win is None:
+            self._help_win = HelpDialog(self, self._help_html())
+            self._help_win.finished.connect(self._on_help_closed)
+        self._help_win.show()
+        self._help_win.raise_()
+        self._help_win.activateWindow()
+        self.act_help.setChecked(True)
+
+    def toggle_help(self):
+        """点一下打开说明窗口，再点一下关掉；F1 同样。"""
+        if self._help_win is not None and self._help_win.isVisible():
+            self._help_win.close()
+            return
+        self.show_help()
+
+    def _on_help_closed(self, *_args):
+        self.act_help.setChecked(False)
+
+    def _show_help_first_time(self):
+        """第一次使用自动弹出说明，之后不再打扰。"""
+        self.show_help()
+        try:
+            config_mod.save_user_config({"ui": {"help_shown": True}})
+        except Exception:                                       # noqa: BLE001
+            pass
 
     # ---------- AI ----------
     def _refresh_ai_menu(self):
@@ -1171,7 +1609,9 @@ class MainWindow(QMainWindow):
                 "path": d.path or "",
                 "encoding": d.encoding,
                 "label": d.label,
-                "text": d.text if d.modified else "",
+                # 有改动、或者磁盘上文件已经没了，都要把正文存进去，
+                # 否则下次打开只剩一个空标签（文件被挪走后内容就白写了）
+                "text": d.text if (d.modified or not (d.path and os.path.exists(d.path))) else "",
                 "modified": bool(d.modified),
             })
         return out
@@ -1180,6 +1620,8 @@ class MainWindow(QMainWindow):
         """把当前进度写进用户目录。失败不影响使用，只是下次从示例开始。"""
         if getattr(self, "_restoring", False):
             return
+        if os.environ.get("CTUTOR_NO_SESSION"):
+            return                       # 自检模式：不要污染用户真实的"上次进度"
         try:
             self._flush()
             session_mod.save(self._session_snapshot(), self.cur)
@@ -1188,6 +1630,8 @@ class MainWindow(QMainWindow):
 
     def _restore_session(self) -> bool:
         """恢复上次的标签。返回 True 表示确实恢复了东西。"""
+        if os.environ.get("CTUTOR_NO_SESSION"):
+            return False                 # 自检模式：永远从内置示例开始
         try:
             data = session_mod.load()
         except Exception:                                       # noqa: BLE001
@@ -1196,6 +1640,7 @@ class MainWindow(QMainWindow):
         if not items:
             return False
         restored = 0
+        missing = 0
         for it in items:
             path = it.get("path") or ""
             stored = it.get("text") or ""
@@ -1205,15 +1650,32 @@ class MainWindow(QMainWindow):
                     with open(path, "rb") as f:
                         raw = f.read()
                 except OSError:
-                    continue
-                disk = raw.decode(enc, errors="replace")
-                disk = _norm_text(disk)
-                text = stored or disk
-                doc = Doc(path=path, encoding=enc, text=text, label=it.get("label") or "未命名")
-                doc.saved_text = disk
-                doc.modified = (text != disk)
+                    # 文件在但读不出来（被占用/没权限）：有存档内容就照样恢复
+                    if not stored:
+                        missing += 1
+                        continue
+                    doc = Doc(path=path, encoding=enc, text=stored,
+                              label=it.get("label") or "未命名")
+                    doc.saved_text = ""
+                    doc.modified = True
+                else:
+                    disk = _norm_text(raw.decode(enc, errors="replace"))
+                    text = stored or disk
+                    doc = Doc(path=path, encoding=enc, text=text,
+                              label=it.get("label") or "未命名")
+                    doc.saved_text = disk
+                    doc.modified = (text != disk)
             elif path:
-                continue                                   # 文件被删了/移走了，跳过
+                # 文件被删了/移走了。**但只要有存档内容就照样恢复**——
+                # 早期版本这里是 continue，结果"文件一挪，那个标签就没了"，
+                # 用户看到的就是"上次开的文件少了"。
+                if not stored:
+                    missing += 1
+                    continue
+                doc = Doc(path=path, encoding=enc, text=stored,
+                          label=it.get("label") or "未命名")
+                doc.saved_text = ""
+                doc.modified = True
             elif stored:
                 # 从没保存过的文档：内容只在会话里
                 doc = Doc(path=None, encoding=enc, text=stored,
@@ -1238,6 +1700,14 @@ class MainWindow(QMainWindow):
         finally:
             self._switching = False
         self._sync_tabs()
+        # 让用户看得见"上次的都在"，而不是自己去数标签
+        try:
+            msg = "已恢复上次打开的 %d 个文件" % restored
+            if missing:
+                msg += "（%d 个文件已不在原位置，只有内容，未恢复）" % missing
+            self.status.showMessage(msg, 8000)
+        except Exception:                                       # noqa: BLE001
+            pass
         return True
 
     # ---------- 对齐（整理缩进） ----------
@@ -1272,10 +1742,10 @@ class MainWindow(QMainWindow):
             "已对齐 %d 行（Ctrl+Shift+Z 可撤回到对齐前）" % changed, 9000)
 
     def undo_format(self):
-        """撤回到对齐前的样子。"""
+        """撤回到上一次整体改写（对齐 / AI 修改）之前的样子。"""
         d = self._doc()
         if d is None or not d.format_undo:
-            self.status.showMessage("没有可撤回的对齐操作", 4000)
+            self.status.showMessage("没有可撤回的修改", 4000)
             return
         self._switching = True
         try:
@@ -1283,8 +1753,199 @@ class MainWindow(QMainWindow):
         finally:
             self._switching = False
         d.format_undo = None
+        d.compare_old = ""
+        d.compare_new = ""
         self._flush()
-        self.status.showMessage("已恢复到对齐前的样子", 6000)
+        self._sync_compare_button()
+        self.status.showMessage("已恢复到修改前的样子", 6000)
+
+    # ---------- AI 修改代码 ----------
+    def _ai_fix_running(self) -> bool:
+        w = getattr(self, "ai_worker", None)
+        return w is not None and w.isRunning()
+
+    def _sync_compare_button(self):
+        """「对照」按钮只在"这个文档刚被 AI 改过"时可用。"""
+        if not hasattr(self, "btn_compare"):
+            return
+        d = self._doc()
+        self.btn_compare.setEnabled(bool(d and d.compare_old))
+
+    def _code_context(self, diag, source: str, span: int = 3) -> str:
+        """取报错行上下几行给模型看，出错行用 --> 标出。"""
+        lines = _norm_text(source).split("\n")
+        line = diag.line or 0
+        if line <= 0 or line > len(lines):
+            return ""
+        lo = max(1, line - span)
+        hi = min(len(lines), line + span)
+        out = []
+        for i in range(lo, hi + 1):
+            mark = "--> " if i == line else "    "
+            out.append("%s%4d  %s" % (mark, i, lines[i - 1]))
+        return "\n".join(out)
+
+    def _ask_fix_mode(self) -> str:
+        """问用户用哪种对照方式。记住过就直接用。"""
+        try:
+            saved = str(((config_mod.load().get("ui") or {}).get("ai_fix_mode")) or "").strip()
+        except Exception:                                       # noqa: BLE001
+            saved = ""
+        if saved in ("inplace", "window", "inline"):
+            return saved
+        dlg = AIFixModeDialog(self, "inplace")
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return ""
+        if dlg.remember():
+            try:
+                config_mod.save_user_config({"ui": {"ai_fix_mode": dlg.mode}})
+            except Exception:                                   # noqa: BLE001
+                pass
+        return dlg.mode
+
+    def do_ai_fix(self):
+        """AI 修改入口：没有诊断就先检查一次，然后问对照方式并开始。"""
+        if self._ai_fix_running() or (self.worker is not None and self.worker.isRunning()):
+            return
+        d = self._doc()
+        if d is None:
+            return
+        if not ai_mod.has_api_key():
+            QMessageBox.information(
+                self, "需要 DeepSeek 密钥",
+                "AI 修改要用 DeepSeek。\n\n"
+                "点菜单「AI → 设置 DeepSeek 密钥…」填一个就行。\n"
+                "（本地知识库的讲解不联网，不需要密钥。）")
+            return
+        rep = getattr(self, "_last_report", None)
+        chosen = (rep or {}).get("chosen") or {}
+        if not rep or not chosen.get("line"):
+            # 还没检查过：先检查，检查完在 _on_done 里自动接着走
+            self._ai_fix_pending = True
+            self.status.showMessage("先检查一下，检查完会自动问你怎么对照…")
+            self.do_check()
+            return
+        self._start_ai_fix(rep)
+
+    def _start_ai_fix(self, rep: dict):
+        self._flush()
+        chosen = rep.get("chosen") or {}
+        src = _norm_text(self.editor.text())
+        if not src.strip():
+            QMessageBox.information(self, "没有代码", "编辑器里还没有代码。")
+            return
+        from engine.diagnostic import Diagnostic
+        diag = Diagnostic(compiler=rep.get("compiler") or "msvc",
+                          message=chosen.get("message", ""),
+                          code=chosen.get("code", ""),
+                          level=chosen.get("level", "error"),
+                          file=chosen.get("file", ""),
+                          line=chosen.get("line", 0),
+                          column=chosen.get("column", 0))
+        mode = self._ask_fix_mode()
+        if not mode:
+            return
+        self._ai_fix_mode = mode
+        self.btn_ai_fix.setEnabled(False)
+        self.status.showMessage("AI 正在想怎么改…（通常几秒到十几秒）")
+        w = AIFixWorker(diag, src, self._code_context(diag, src), self)
+        w.done.connect(self._on_ai_fix_done)
+        w.failed.connect(self._on_ai_fix_failed)
+        self.ai_worker = w
+        w.start()
+
+    def _on_ai_fix_failed(self, tb: str):
+        self.btn_ai_fix.setEnabled(True)
+        self.status.showMessage("AI 修改失败", 6000)
+        QMessageBox.critical(self, "AI 修改失败", str(tb)[-1200:])
+
+    def _on_ai_fix_done(self, res):
+        self.btn_ai_fix.setEnabled(True)
+        self._ai_fix_pending = False
+        if not res.ok:
+            msg = "没能给出可用的修正代码：\n\n%s" % res.error
+            if res.warnings:
+                msg += "\n\n过程：" + "；".join(res.warnings[-3:])
+            QMessageBox.warning(self, "AI 修改", msg)
+            self.status.showMessage("AI 没有给出可用的代码", 6000)
+            return
+        self._apply_ai_result(res, getattr(self, "_ai_fix_mode", "inplace"))
+
+    def _apply_ai_result(self, res, mode: str):
+        """按用户选的对照方式把结果放出去。
+
+        三种方式**都不写文件**：只改编辑器缓冲区，标签会变成"已修改"，
+        存不存由用户自己决定。
+        """
+        d = self._doc()
+        if d is None:
+            return
+        before = _norm_text(self.editor.text())
+        chosen = {}
+        try:
+            chosen = (getattr(self, "_last_report", None) or {}).get("chosen") or {}
+        except Exception:                                       # noqa: BLE001
+            pass
+        changed = len(res.changes)
+
+        if mode == "window":
+            win = FixedCodeWindow(self, res.fixed_code, res.changes,
+                                  "这是 AI 给的修正版本（%s）。原文件没有任何改动，"
+                                  "看完点「应用到编辑器」才生效。" % res.summary())
+            win.applied.connect(lambda: self._apply_ai_result(res, "inplace"))
+            self._fixed_win = win            # 留住引用，否则窗口会被回收
+            win.show()
+            win.raise_()
+            self.status.showMessage("已打开对照窗口（原文件未改动）", 6000)
+            return
+
+        if mode == "inline":
+            new_text, n = ai_fix_mod.apply_inline_hints(
+                before, res.changes, anchor_line=chosen.get("line", 0))
+            if not n:
+                QMessageBox.information(
+                    self, "无法插入建议",
+                    "没找到合适的位置插入建议。\n"
+                    "（可能出问题的那一行位于多行字符串或块注释里，插注释会改变程序行为，"
+                    "所以这里选择不动它。）")
+                return
+            d.format_undo = before
+            d.compare_old = before
+            d.compare_new = new_text
+            self._switching = True
+            try:
+                self.editor.set_text(new_text)
+            finally:
+                self._switching = False
+            self._flush()
+            self._sync_compare_button()
+            self.status.showMessage("已在 %d 处加了 // AI 建议（原代码未改动）" % n, 9000)
+            return
+
+        # 默认：原位修改
+        d.format_undo = before
+        d.compare_old = before
+        d.compare_new = res.fixed_code
+        self._switching = True
+        try:
+            self.editor.set_text(res.fixed_code)
+        finally:
+            self._switching = False
+        self._flush()
+        self._sync_compare_button()
+        self.status.showMessage(
+            "已应用 AI 修改（%d 处）。点「对照」看改了什么；Ctrl+Shift+Z 可以还原" % changed,
+            10000)
+
+    def show_ai_compare(self):
+        """对照：AI 修改前后的逐行差异。"""
+        d = self._doc()
+        if d is None or not d.compare_old:
+            QMessageBox.information(self, "没有可对照的内容",
+                                    "先点「AI 修改」，改完才能对照。")
+            return
+        DiffDialog(self, d.compare_old, d.compare_new,
+                   "对照：AI 改了什么").exec()
 
     # ---------- 项目 ----------
     def _projects_dir(self) -> str:
@@ -1481,12 +2142,22 @@ class MainWindow(QMainWindow):
             "编译器 %s　诊断 %d 条　%s" % (
                 rep.get("compiler"), n,
                 "；".join(rep.get("notes") or []) or "SARIF %s" % rep.get("sarif_status")))
+        # 用户点了「AI 修改」但还没检查过：检查完自动接着走，不用点第二次
+        if getattr(self, "_ai_fix_pending", False):
+            self._ai_fix_pending = False
+            if ch.get("line"):
+                QTimer.singleShot(200, lambda: self._start_ai_fix(rep))
+            else:
+                QMessageBox.information(
+                    self, "AI 修改",
+                    "这次编译没有可定位的错误行，AI 不知道要改哪里。")
 
     def _rerender_current(self):
+        """只改了"讲到第几层"这类参数时重画：内容变了，但阅读位置该保留。"""
         if getattr(self, "_last_report", None):
-            self._render_report(self._last_report)
+            self._render_report(self._last_report, keep_scroll=True)
 
-    def _render_report(self, rep: dict):
+    def _render_report(self, rep: dict, keep_scroll: bool = False):
         """把结构化报告渲染成 HTML，并在编辑器里把出错位置标红。"""
         self._mark_from_report(rep)
         diags = rep.get("diagnostics") or []
@@ -1500,13 +2171,13 @@ class MainWindow(QMainWindow):
             body = ('<div style="font-family:\'Microsoft YaHei\',sans-serif;font-size:12pt;'
                     'color:#15803D;padding:12px;">编译通过，没有发现任何错误或警告。</div>')
             self._explanation_html = "".join(head) + body
-            self._show_explanation()
+            self._show_explanation(keep_scroll)
             return
 
         exp = rep.get("explanation")
         if not exp:
             self._explanation_html = "".join(head) + "<p>没有可展示的诊断。</p>"
-            self._show_explanation()
+            self._show_explanation(keep_scroll)
             return
 
         depth = self.cmb_depth.currentData()
@@ -1538,15 +2209,12 @@ class MainWindow(QMainWindow):
                           '第一条往往是根因，修好它之后后面那些多半会一起消失。'
                           '先只改下面讲的那一处，再重新检查。</div>')
         self._explanation_html = "".join(head) + extra + render_mod.render_html(e, depth)
-        self._show_explanation()
+        self._show_explanation(keep_scroll)
 
-    def _show_explanation(self):
-        """展示讲解。若「使用说明」正开着，自动收起——用户按了检查就是想看结果。"""
+    def _show_explanation(self, keep_scroll: bool = False):
+        """展示讲解。使用说明已是独立窗口，不会再被讲解顶掉。"""
         self.tabs.setCurrentIndex(0)             # 切回「讲解」页
-        if self.act_help.isChecked():
-            self.act_help.setChecked(False)      # 触发 _apply_view
-        else:
-            self._apply_view()
+        self._apply_view(keep_scroll)
 
     # ---------- 缩放（Ctrl + 滚轮 / Ctrl +/-） ----------
     def eventFilter(self, obj, ev):
@@ -1689,6 +2357,11 @@ def main(argv=None) -> int:
 
     if args.selftest or args.offscreen:
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    # 自检必须**可重复**：不能读用户真实的"上次进度"，否则打包验证会随开发机的
+    # 使用状态而时好时坏（真踩过：自检读到了用户会话里的 4 个文件，
+    # 编译不报错 → 验证失败；更糟的是可能把示例写回用户会话里）。
+    if args.selftest or args.offscreen:
+        os.environ["CTUTOR_NO_SESSION"] = "1"
 
     app = QApplication(sys.argv[:1])
     font_family = ensure_cjk_font(app)

@@ -26,6 +26,13 @@ from engine import config as _config_mod                      # noqa: E402
 from engine import session as _session_mod                    # noqa: E402
 _config_mod.user_config_path = lambda: os.path.join(_TEST_DIR, "config.json")
 
+# 默认标记"说明已看过"，否则每个 MainWindow 都会在 0.9 秒后自动弹说明窗口，
+# 把后面所有断言搅乱。专门测"首次启动自动弹"的那一段会自己把它改回 False。
+try:
+    _config_mod.save_user_config({"ui": {"help_shown": True}})
+except Exception:                                            # noqa: BLE001
+    pass
+
 
 def _clear_session():
     """删掉会话文件，让下一个窗口从示例开始。"""
@@ -170,27 +177,39 @@ check("AI 状态菜单项会显示当前密钥来源",
       win.act_ai_info.text() if hasattr(win, "act_ai_info") else None)
 check("AI 复选框与配置联动（未配置时不会被强制勾上）",
       (not win.chk_ai.isChecked()) or __import__("engine.ai", fromlist=["x"]).has_api_key())
-check("默认展开，先让新用户看到说明", win.act_help.isChecked())
-check("展开时下方面板显示使用说明", "帮你看懂编译报错" in win.view.toHtml())
+print()
+print("— 使用说明（独立窗口，不占讲解栏）—")
+check("说明不再默认塞进讲解栏", "帮你看懂编译报错" not in win.view.toHtml())
+check("讲解栏默认显示「按 F5」提示", "F5" in win.view.toHtml())
 
-win.act_help.setChecked(False)
+win.toggle_help()
 app.processEvents()
-check("收起后不再显示说明", "帮你看懂编译报错" not in win.view.toHtml())
-check("收起后显示「按 F5」提示", "F5" in win.view.toHtml())
+check("点一下能打开说明窗口",
+      win._help_win is not None and win._help_win.isVisible())
+check("说明窗口里确实是使用说明",
+      "帮你看懂编译报错" in win._help_win.view.toHtml())
+check("打开后讲解栏没有被说明顶掉", "帮你看懂编译报错" not in win.view.toHtml())
+check("菜单项勾上（表示说明正开着）", win.act_help.isChecked())
 
-win.act_help.setChecked(True)          # 重新打开
+win.toggle_help()                       # 再点一下 → 关闭
 app.processEvents()
-check("可以再次打开", "帮你看懂编译报错" in win.view.toHtml())
+check("再点一下能关掉（不需要按别的按钮）", not win.act_help.isChecked())
+check("关闭后菜单项取消勾选", not win.act_help.isChecked())
 
-# 开着帮助时按检查 —— 应自动收起，把位置让给讲解
+# 按检查时，说明窗口**不该**被强行关掉（它现在是独立窗口，互不影响）
+win.toggle_help()
+app.processEvents()
 rep = report_mod.check_once(win._working_copy(), depth=4)
 win._last_report = rep
 win._render_report(rep)
 app.processEvents()
-check("检查后自动收起帮助（否则用户会以为没反应）", not win.act_help.isChecked())
-check("检查后显示分层讲解", "【1 结论】" in win.view.toHtml())
+check("检查后讲解栏显示分层讲解", "【1 结论】" in win.view.toHtml())
+check("检查不会关掉说明窗口（独立窗口，互不干扰）",
+      win._help_win is not None and win._help_win.isVisible())
+win.toggle_help()
+app.processEvents()
 
-# 收起状态下切换深度，讲解应重新渲染且仍不显示说明
+# 切换深度，讲解重渲染，仍不显示说明
 win.cmb_depth.setCurrentIndex(0)
 app.processEvents()
 check("切换深度不会把说明又弹出来",
@@ -595,8 +614,8 @@ print("— 未保存提示 —")
 _d = win4._doc()
 check("刚打开的文档不算已修改（否则退出时会白问一遍）", _d.modified is False,
       _d.modified)
-check("没有改动时不会弹框（_confirm_discard 直接放行）",
-      win4._confirm_discard(_d) is True)
+check("没有改动时不会弹框（_confirm_close_all 直接放行）",
+      win4._confirm_close_all([_d]) == "save")
 
 # 模拟用户编辑
 win4.editor.set_text(win4.editor.text().replace("int a = 1", "int a = 2"))
@@ -607,23 +626,38 @@ check("编辑后标记为已修改", _d.modified is True, _d.modified)
 check("已修改的标签标题带 * 号", win4.tabbar.tabText(win4.cur).startswith("* "),
       win4.tabbar.tabText(win4.cur))
 
-# closeEvent：用户点「取消」应当拦住退出
-_orig_confirm = win4._confirm_discard
-win4._confirm_discard = lambda doc: False
+
 class _Ev:
-    def __init__(self): self.ignored = False; self.accepted = False
-    def ignore(self): self.ignored = True
-    def accept(self): self.accepted = True
+    def __init__(self):
+        self.ignored = False
+        self.accepted = False
+
+    def ignore(self):
+        self.ignored = True
+
+    def accept(self):
+        self.accepted = True
+
+
+# closeEvent：用户点「取消」应当拦住退出
+# 注意：现在退出是「一次问完所有未保存文件」，所以替身要换掉 _confirm_close_all，
+# 而不是早期的 _confirm_discard（换错了会弹出真的模态框，测试直接挂住）。
+_orig_confirm_all = win4._confirm_close_all
+win4._confirm_close_all = lambda docs, **kw: "cancel"
 _ev = _Ev()
 win4.closeEvent(_ev)
 check("有未保存改动且用户点取消时，退出会被拦住", _ev.ignored and not _ev.accepted)
 
-# 用户点「不保存」→ 放行
-win4._confirm_discard = lambda doc: True
+# 用户点「不保存」→ 放行，且改动仍留在会话里
+win4._confirm_close_all = lambda docs, **kw: "drop"
 _ev2 = _Ev()
 win4.closeEvent(_ev2)
 check("用户选择不保存时，退出继续", _ev2.accepted)
-win4._confirm_discard = _orig_confirm
+_sess = _session_mod.load()
+check("选了「不保存」的改动仍然留在上次进度里（下次还能接着改）",
+      any("int a = 2" in (it.get("text") or "") for it in _sess.get("docs") or []),
+      [len(it.get("text") or "") for it in _sess.get("docs") or []])
+win4._confirm_close_all = _orig_confirm_all
 
 # 清理：把改动抹掉，避免真的退出时弹框
 for _doc in win4.docs:
@@ -771,6 +805,198 @@ for _w in (win6, win7, win8):
     _w._dirty_timer.stop()
     _w.close()
 _clear_session()
+
+# ---------------------------------------------------------------- AI 修改
+print()
+print("— AI 修改：三种对照方式 —")
+_clear_session()
+win9 = panel.MainWindow()
+app.processEvents()
+for _ in range(25):
+    app.processEvents()
+    time.sleep(0.05)
+win9._dirty_timer.stop()
+
+_ai_src = ("#include <stdio.h>\n"
+           "int main(void) {\n"
+           "    int x = 10\n"
+           "    printf(\"%d\\n\", x);\n"
+           "    return 0;\n"
+           "}\n")
+_ai_fixed = ("#include <stdio.h>\n"
+             "int main(void) {\n"
+             "    int x = 10;\n"
+             "    printf(\"%d\\n\", x);\n"
+             "    return 0;\n"
+             "}\n")
+_ai_path = os.path.join(ROOT, "build", "mdoc", "ai_fix.c")
+with open(_ai_path, "w", encoding="utf-8", newline="\n") as f:
+    f.write(_ai_src)
+win9._open_path(_ai_path)
+app.processEvents()
+for _ in range(10):
+    app.processEvents()
+    time.sleep(0.05)
+
+
+class _FakeFix:
+    ok = True
+    fixed_code = _ai_fixed
+    changes = [{"line": 3, "before": "int x = 10", "after": "int x = 10;",
+                "why": "缺少分号"}]
+    confidence = "high"
+    degraded = False
+    notes = []
+    warnings = []
+    usage = {"prompt_tokens": 300, "completion_tokens": 120}
+    attempts = 1
+    error = ""
+    refuse_reason = ""
+
+    def summary(self):
+        return "1 处修改，把握：high"
+
+
+def _editor_norm(w):
+    return (w.editor.text() or "").replace("\r\n", "\n")
+
+
+_orig_has_key = panel.ai_mod.has_api_key
+_orig_request = panel.ai_fix_mod.request_fix
+panel.ai_mod.has_api_key = lambda: True
+panel.ai_fix_mod.request_fix = lambda *a, **k: _FakeFix()
+try:
+    win9._last_report = {"compiler": "msvc",
+                         "chosen": {"line": 3, "column": 9, "code": "C2146",
+                                    "level": "error", "message": "缺少分号"},
+                         "diagnostics": [{"line": 3}]}
+
+    check("工具栏有「AI 修改」按钮", hasattr(win9, "btn_ai_fix"))
+    check("工具栏有「对照」按钮，且默认不可用",
+          hasattr(win9, "btn_compare") and not win9.btn_compare.isEnabled())
+
+    # ---- 方式一：原位修改 ----
+    win9._ask_fix_mode = lambda: "inplace"
+    win9.do_ai_fix()
+    for _ in range(80):
+        app.processEvents()
+        time.sleep(0.05)
+        if not win9._ai_fix_running():
+            break
+    for _ in range(15):
+        app.processEvents()
+        time.sleep(0.05)
+    check("原位修改：编辑器换成了修正版", "int x = 10;" in _editor_norm(win9))
+    check("原位修改：文档被标记为已修改（退出时会问要不要存）",
+          win9._doc().modified is True)
+    check("原位修改：对照按钮变为可用", win9.btn_compare.isEnabled())
+    check("原位修改：记住了修改前的内容（供对照与还原）",
+          "int x = 10\n" in (win9._doc().compare_old or ""))
+
+    win9.undo_format()
+    app.processEvents()
+    check("撤回后回到原样", "int x = 10\n" in _editor_norm(win9))
+    check("撤回后对照按钮禁用", not win9.btn_compare.isEnabled())
+
+    # ---- 方式三：行内注释 ----
+    win9._last_report["chosen"]["line"] = 3
+    win9._ask_fix_mode = lambda: "inline"
+    win9.do_ai_fix()
+    for _ in range(80):
+        app.processEvents()
+        time.sleep(0.05)
+        if not win9._ai_fix_running():
+            break
+    for _ in range(15):
+        app.processEvents()
+        time.sleep(0.05)
+    _inline_txt = _editor_norm(win9)
+    check("行内方式：插入了 // AI 建议", "// AI 建议" in _inline_txt, _inline_txt[:200])
+    check("行内方式：原代码没有被改掉", "int x = 10\n" in _inline_txt)
+    check("行内方式：建议插在出问题那一行下面",
+          _inline_txt.split("\n")[3].strip().startswith("// AI 建议"),
+          _inline_txt.split("\n")[3])
+    win9.undo_format()
+    app.processEvents()
+
+    # ---- 方式二：独立窗口 ----
+    win9._ask_fix_mode = lambda: "window"
+    win9.do_ai_fix()
+    for _ in range(80):
+        app.processEvents()
+        time.sleep(0.05)
+        if not win9._ai_fix_running():
+            break
+    for _ in range(20):
+        app.processEvents()
+        time.sleep(0.05)
+    _fw = getattr(win9, "_fixed_win", None)
+    check("独立窗口方式：窗口打开了", _fw is not None and _fw.isVisible())
+    check("独立窗口方式：窗口里是修正版",
+          _fw is not None and "int x = 10;" in _fw.view.toPlainText())
+    check("独立窗口方式：原编辑器一个字没动", "int x = 10\n" in _editor_norm(win9))
+    if _fw is not None:
+        _fw._apply()
+        for _ in range(20):
+            app.processEvents()
+            time.sleep(0.05)
+        check("独立窗口方式：点「应用到编辑器」后生效", "int x = 10;" in _editor_norm(win9))
+        check("独立窗口方式：应用后对照可用", win9.btn_compare.isEnabled())
+
+    # ---- 对照窗口 ----
+    _dd = panel.DiffDialog(win9, win9._doc().compare_old, win9._doc().compare_new)
+    _dd.show()
+    app.processEvents()
+    check("对照窗口能打开并显示差异",
+          "int x = 10;" in _dd.view.toPlainText(), _dd.view.toPlainText()[:120])
+    _dd.close()
+finally:
+    panel.ai_mod.has_api_key = _orig_has_key
+    panel.ai_fix_mod.request_fix = _orig_request
+
+for _doc in win9.docs:
+    _doc.saved_text = _doc.text
+    _doc.modified = False
+win9._dirty_timer.stop()
+_clear_session()
+win9.close()
+
+# ---------------------------------------------------------------- 平滑滚动 / 首启说明
+print()
+print("— 讲解栏平滑滚动与首次使用说明 —")
+_clear_session()
+# 把"已看过说明"改回 False，模拟第一次装好程序打开
+_config_mod.save_user_config({"ui": {"help_shown": False}})
+win10 = panel.MainWindow()
+app.processEvents()
+for _ in range(40):
+    app.processEvents()
+    time.sleep(0.05)
+win10._dirty_timer.stop()
+check("讲解栏装了平滑滚动", any(isinstance(s, panel.SmoothScroller)
+                               for s in getattr(win10, "_scrollers", [])))
+check("运行输出区也装了平滑滚动",
+      len(getattr(win10, "_scrollers", [])) >= 2)
+
+_help_flag = bool((_config_mod.load().get("ui") or {}).get("help_shown"))
+check("首次使用会自动弹出说明（不需要用户先按 F1）",
+      _help_flag and win10._help_win is not None and win10._help_win.isVisible(),
+      (_help_flag, win10._help_win))
+check("弹出后会记下「已看过」，下次不再打扰",
+      bool((_config_mod.load().get("ui") or {}).get("help_shown")))
+
+# 重复弹不会把已开的窗口关掉
+win10.show_help()
+app.processEvents()
+check("再调一次 show_help 不会关掉已经打开的窗口",
+      win10._help_win is not None and win10._help_win.isVisible())
+if win10._help_win is not None:
+    win10._help_win.close()
+app.processEvents()
+
+win10._dirty_timer.stop()
+_clear_session()
+win10.close()
 
 win3.close()
 

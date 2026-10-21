@@ -184,6 +184,83 @@ window.__ctutor_mark_state = {stage: 'start'};
     window.__ctutor_mark_state = { stage: 'error', error: String(e && e.message ? e.message : e) };
   }
 })();
+
+// ---------------------------------------------------------------- 右键菜单汉化
+// Monaco 没有给中文语境提供现成的菜单文案，右键出来全是 Cut / Copy / Paste。
+// 不去改第三方包（下次升级就被覆盖），而是**监听 DOM**：菜单一出现就替换文字。
+// 这样做的好处是不会破坏任何命令绑定——只改显示，行为完全不变。
+(function () {
+  const MAP = {
+    'Cut': '剪切',
+    'Copy': '复制',
+    'Paste': '粘贴',
+    'Copy As': '复制为',
+    'Copy with Syntax Highlighting': '复制（保留语法高亮）',
+    'Select All': '全选',
+    'Command Palette': '命令面板',
+    'Go to Symbol...': '跳到符号…',
+    'Go to Symbol': '跳到符号',
+    'Go to Definition': '跳到定义',
+    'Go to Type Definition': '跳到类型定义',
+    'Go to Declaration': '跳到声明',
+    'Go to Implementations': '跳到实现',
+    'Go to References': '查看引用',
+    'Peek Definition': '预览定义',
+    'Peek Declaration': '预览声明',
+    'Peek Type Definition': '预览类型定义',
+    'Peek Implementations': '预览实现',
+    'Peek References': '预览引用',
+    'Rename Symbol': '重命名符号',
+    'Change All Occurrences': '修改所有匹配项',
+    'Format Document': '格式化文档',
+    'Format Selection': '格式化选中部分',
+    'Toggle Line Comment': '切换行注释',
+    'Toggle Block Comment': '切换块注释',
+    'Undo': '撤销',
+    'Redo': '重做',
+    'Delete': '删除',
+    'Show Whitespace': '显示空白字符',
+    'Show Minimap': '显示缩略图',
+    'Linked Editing': '联动编辑',
+    'Trigger Parameter Hints': '显示参数提示',
+    'Trigger Suggest': '触发补全',
+    'Source Action...': '源码操作…',
+    'Refactor...': '重构…',
+  };
+
+  function translate(root) {
+    if (!root || !root.querySelectorAll) return 0;
+    let n = 0;
+    root.querySelectorAll('.action-label').forEach(function (el) {
+      const raw = (el.textContent || '').trim();
+      const zh = MAP[raw];
+      if (zh && raw !== zh) { el.textContent = zh; n++; }
+    });
+    return n;
+  }
+
+  // 菜单是懒创建的，出现时机不确定，所以用 MutationObserver 盯着
+  const obs = new MutationObserver(function (muts) {
+    for (const m of muts) {
+      const nodes = m.addedNodes || [];
+      for (const node of nodes) {
+        if (node.nodeType !== 1) continue;
+        const looksMenu = (node.classList && node.classList.contains('monaco-menu'))
+          || (node.querySelector && node.querySelector('.monaco-menu'));
+        if (!looksMenu) continue;
+        // 刚插入的节点可能还没填完文字，等一帧再翻
+        setTimeout(function () { translate(node); }, 0);
+        setTimeout(function () { translate(node); }, 60);
+      }
+    }
+  });
+  try {
+    obs.observe(document.body, { childList: true, subtree: true });
+    window.__ctutor_ctxmenu_zh = true;
+  } catch (e) {
+    window.__ctutor_ctxmenu_zh = false;
+  }
+})();
 </script>
 """
 
