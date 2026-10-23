@@ -27,6 +27,30 @@ from typing import Any, Dict, List, Optional
 SESSION_SCHEMA = "ctutor/session/1"
 MAX_DOCS = 20                       # 最多记这么多标签
 MAX_TEXT_BYTES = 1_500_000          # 会话里最多存这么多文本（约 1.5 MB）
+MAX_ANCHORS = 200                   # 单个标签最多记这么多锚点
+
+
+def _clean_anchors(raw: Any) -> List[Dict[str, Any]]:
+    """把锚点数据洗成可信的形态。坏数据直接丢，不让它挡住打开文件。"""
+    out: List[Dict[str, Any]] = []
+    if not isinstance(raw, list):
+        return out
+    for a in raw[:MAX_ANCHORS]:
+        if not isinstance(a, dict):
+            continue
+        try:
+            line = int(a.get("line") or 0)
+        except (TypeError, ValueError):
+            continue
+        if line <= 0:
+            continue
+        out.append({
+            "name": str(a.get("name") or "")[:60],
+            "line": line,
+            "text": str(a.get("text") or "")[:80],
+        })
+    out.sort(key=lambda x: x["line"])
+    return out
 
 
 def session_path(cfg: Optional[Dict[str, Any]] = None) -> str:
@@ -67,6 +91,11 @@ def save(docs: List[Dict[str, Any]], active: int,
                 budget -= len(raw)
             else:
                 item["text"] = ""
+        # 锚点：书签，不写进 .c 文件，只能跟着会话走。
+        # 只存"能拿去跳转"的最小信息；坏数据在这里就洗掉，免得下次打开崩。
+        anchors = _clean_anchors(d.get("anchors"))
+        if anchors:
+            item["anchors"] = anchors
         keep.append(item)
 
     if not keep:
@@ -121,6 +150,7 @@ def load(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
             "label": d.get("label") if isinstance(d.get("label"), str) else "未命名",
             "modified": bool(d.get("modified")),
             "text": text if isinstance(text, str) else "",
+            "anchors": _clean_anchors(d.get("anchors")),
         })
     try:
         active = int(data.get("active") or 0)

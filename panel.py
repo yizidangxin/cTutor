@@ -16,6 +16,7 @@ import html
 import json
 import os
 import sys
+import tempfile
 import time
 import traceback
 
@@ -35,9 +36,10 @@ from PySide6.QtCore import (Qt, QEvent, QEasingCurve, QObject,        # noqa: E4
 from PySide6.QtGui import QAction, QFont, QFontDatabase, QKeySequence  # noqa: E402
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox,   # noqa: E402
                                QDialog, QDialogButtonBox, QFileDialog, QHBoxLayout,
-                               QInputDialog, QLabel, QLineEdit, QMainWindow,
+                               QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem,
+                               QMainWindow,
                                QMessageBox, QPlainTextEdit, QPushButton, QRadioButton,
-                               QSpinBox, QSplitter, QTabBar, QTabWidget,
+                               QSizePolicy, QSpinBox, QSplitter, QTabBar, QTabWidget,
                                QTextBrowser, QVBoxLayout, QWidget)
 from engine import ai as ai_mod                                     # noqa: E402
 from engine import ai_fix as ai_fix_mod                             # noqa: E402
@@ -284,6 +286,83 @@ class EditorAdapter:
         except Exception as e:                                      # noqa: BLE001
             callback({"stage": "error", "error": str(e)})
 
+    # ---- 右键菜单扩展 + 锚点 ----
+    def add_context_action(self, action_id: str, label: str) -> bool:
+        """往编辑器右键菜单里加一条命令。
+
+        qtmonaco 自带这个扩展点（add_action + context_menu_action_triggered），
+        所以不用自己搭 QWebChannel、也不用改第三方包。
+        """
+        if not self.monaco:
+            return False
+        try:
+            self.widget.add_action(action_id, label, language="c")
+            return True
+        except Exception:                                           # noqa: BLE001
+            return False
+
+    def set_anchors(self, items, callback=None) -> None:
+        """把锚点画到编辑器里。纯装饰器：不新增、不修改任何字符。"""
+        if not self.monaco:
+            return
+        js = "window.__ctutor_set_anchors(%s)" % json.dumps(items, ensure_ascii=False)
+        try:
+            if callback is None:
+                self.widget.page().runJavaScript(js)
+            else:
+                self.widget.page().runJavaScript(js, callback)
+        except Exception:                                           # noqa: BLE001
+            pass
+
+    def goto_anchor(self, line: int) -> None:
+        """跳到某一行，并把它滚到屏幕中间。"""
+        if not self.monaco:
+            try:
+                from PySide6.QtGui import QTextCursor
+
+                cur = self.widget.textCursor()
+                cur.movePosition(QTextCursor.Start)
+                cur.movePosition(QTextCursor.Down, QTextCursor.MoveAnchor,
+                                 max(0, int(line) - 1))
+                self.widget.setTextCursor(cur)
+                self.widget.centerCursor()
+            except Exception:                                       # noqa: BLE001
+                pass
+            return
+        try:
+            self.widget.page().runJavaScript(
+                "window.__ctutor_goto_anchor(%d)" % int(line))
+        except Exception:                                           # noqa: BLE001
+            pass
+
+    def cursor_info(self, callback) -> None:
+        """取当前光标行号和该行原文（回调一个 JSON 字符串）。"""
+        if not self.monaco:
+            try:
+                cur = self.widget.textCursor()
+                callback(json.dumps({"line": cur.blockNumber() + 1,
+                                     "text": cur.block().text()}, ensure_ascii=False))
+            except Exception:                                       # noqa: BLE001
+                callback("{}")
+            return
+        try:
+            self.widget.page().runJavaScript("window.__ctutor_cursor_info()", callback)
+        except Exception:                                           # noqa: BLE001
+            callback("{}")
+
+    def eval_js(self, code, callback=None) -> bool:
+        """跑一段 JS（可选回调）。失败不抛异常，只返回 False。"""
+        if not self.monaco:
+            return False
+        try:
+            if callback is None:
+                self.widget.page().runJavaScript(code)
+            else:
+                self.widget.page().runJavaScript(code, callback)
+            return True
+        except Exception:                                           # noqa: BLE001
+            return False
+
 
 # ---------------------------------------------------------------- 后台检查
 class CheckWorker(QThread):
@@ -396,7 +475,7 @@ class Doc:
     """
 
     __slots__ = ("path", "encoding", "text", "saved_text", "label", "modified",
-                 "marks", "format_undo", "compare_old", "compare_new")
+                 "marks", "format_undo", "compare_old", "compare_new", "anchors")
 
     def __init__(self, path=None, encoding="mbcs", text="", label="未命名"):
         self.path = path
@@ -409,6 +488,9 @@ class Doc:
         self.format_undo = None  # 上一次"整体改写"之前的文本（对齐 / AI 修改共用）
         self.compare_old = ""    # AI 修改前
         self.compare_new = ""    # AI 修改后
+        # 锚点：{"name": str, "line": int, "text": str}
+        # 只是显示用的书签，**不写进 .c 文件**，也不算"文件被改动"
+        self.anchors = []
 
     def title(self) -> str:
         base = os.path.basename(self.path) if self.path else self.label
@@ -714,6 +796,80 @@ class HelpDialog(QDialog):
         lay.addLayout(row)
 
 
+# ---------------------------------------------------------------- 锚点列表
+class AnchorDialog(QDialog):
+    """锚点列表：双击跳转，也可以在这儿重命名/删除。
+
+    为什么用列表而不是下拉菜单：锚点是要「一眼扫过去找到目标」的东西，
+    列表能同时显示名字、行号和那行代码，下拉菜单只能显示一行文字。
+    """
+
+    def __init__(self, anchors, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("锚点")
+        self.resize(560, 420)
+        self.action = ""          # goto / rename / delete / ""
+        self.index = -1
+
+        tip = QLabel("双击直接跳过去。锚点只是书签，不会往代码里插任何东西。")
+        tip.setStyleSheet("color:#4B5563;")
+        tip.setWordWrap(True)
+
+        self.list = QListWidget()
+        for i, a in enumerate(anchors or []):
+            line = int(a.get("line") or 1)
+            text = (a.get("text") or "").strip()
+            label = "%s" % (a.get("name") or "未命名")
+            if text:
+                label += "    · 第 %d 行    · %s" % (line, text[:60])
+            else:
+                label += "    · 第 %d 行" % line
+            it = QListWidgetItem(label)
+            it.setData(Qt.UserRole, i)
+            it.setToolTip("第 %d 行：%s" % (line, text))
+            self.list.addItem(it)
+        if self.list.count():
+            self.list.setCurrentRow(0)
+        self.list.itemDoubleClicked.connect(self._on_double)
+
+        self.btn_goto = QPushButton("跳转")
+        self.btn_goto.setDefault(True)
+        self.btn_goto.clicked.connect(lambda: self._done("goto"))
+        self.btn_rename = QPushButton("重命名")
+        self.btn_rename.clicked.connect(lambda: self._done("rename"))
+        self.btn_del = QPushButton("删除")
+        self.btn_del.clicked.connect(lambda: self._done("delete"))
+        self.btn_close = QPushButton("关闭")
+        self.btn_close.clicked.connect(self.reject)
+
+        row = QHBoxLayout()
+        row.addWidget(self.btn_goto)
+        row.addWidget(self.btn_rename)
+        row.addWidget(self.btn_del)
+        row.addStretch(1)
+        row.addWidget(self.btn_close)
+
+        lay = QVBoxLayout(self)
+        lay.addWidget(tip)
+        lay.addWidget(self.list, 1)
+        lay.addLayout(row)
+
+        has = bool(anchors)
+        for b in (self.btn_goto, self.btn_rename, self.btn_del):
+            b.setEnabled(has)
+
+    def _on_double(self, _item):
+        self._done("goto")
+
+    def _done(self, action):
+        row = self.list.currentRow()
+        if row < 0:
+            return
+        self.action = action
+        self.index = row
+        self.accept()
+
+
 # ---------------------------------------------------------------- 主窗口
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -769,6 +925,25 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(1200, self._apply_zoom)
         # 补全脚本在页面加载后异步注册，稍等一下再查询状态
         QTimer.singleShot(1500, self._check_completion_status)
+        # 右键菜单里的「锚点」命令：qtmonaco 的扩展点在页面就绪后才可用，
+        # 它内部会把消息缓存到初始化完成，所以这里早一点挂也没关系。
+        if self.editor.monaco:
+            try:
+                self.editor.widget.context_menu_action_triggered.connect(
+                    self._on_editor_action)
+            except Exception:                                   # noqa: BLE001
+                pass
+        self._install_editor_actions()
+        QTimer.singleShot(1200, self._install_editor_actions)
+        QTimer.singleShot(2500, self._sync_anchors)   # 慢机器上再补一次
+        # 右键菜单汉化的最后一道保险：网页菜单由注入脚本自己轮询，
+        # 这里再兜住"万一弹的是 Qt 原生菜单"的情况，并留一份现场快照。
+        self._ctx_dump_done = False
+        self._ctx_js_ticks = 0
+        self._ctx_timer = QTimer(self)
+        self._ctx_timer.setInterval(700)
+        self._ctx_timer.timeout.connect(self._ctx_menu_watch)
+        self._ctx_timer.start()
         # 第一次使用：自动弹一次使用说明；之后不再打扰（记在用户配置里）
         try:
             if not bool((config_mod.load().get("ui") or {}).get("help_shown")):
@@ -888,6 +1063,8 @@ class MainWindow(QMainWindow):
             self.editor.clear_marks()
             if remember_marks and d.marks:
                 self.editor.mark_errors(d.marks)
+            # 锚点跟着标签走：切过来就把这个文档的锚点画上（只画，不动文字）
+            self.editor.set_anchors(list(d.anchors))
             # 没改动过的文档：把基线校正成编辑器实际返回的文本。
             # 编辑器可能对内容做归一化（比如换行符），不校正的话一打开就是"已修改"。
             if not d.modified:
@@ -1058,6 +1235,7 @@ class MainWindow(QMainWindow):
             self._save_session()         # 保存后改动已清零，刷新一次会话
         try:
             self._dirty_timer.stop()
+            self._ctx_timer.stop()       # 关窗口后别再往已释放的页面上跑 JS
         except Exception:                                       # noqa: BLE001
             pass
         event.accept()
@@ -1087,8 +1265,9 @@ class MainWindow(QMainWindow):
     def _build_ui(self):
         central = QWidget()
         layout = QVBoxLayout(central)
-        layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(6)
+        # 紧凑排版：边距和间距都压到最小，省下的纵向空间全部让给代码区
+        layout.setContentsMargins(6, 4, 6, 4)
+        layout.setSpacing(4)
 
         bar = QHBoxLayout()
         # 工具栏只留"每次都要点"的按钮。
@@ -1110,6 +1289,14 @@ class MainWindow(QMainWindow):
         self.btn_compare = QPushButton("对照")
         self.btn_compare.setToolTip("和 AI 修改之前的版本逐行对照")
         self.btn_compare.setEnabled(False)
+        # 锚点：书签列表。添加锚点在右键菜单里（右键 → 添加锚点…），
+        # 这里只负责"列出全部 + 跳转"，因为跳转是最高频的动作。
+        self.btn_anchor = QPushButton("锚点")
+        self.btn_anchor.setToolTip(
+            "列出所有锚点，双击跳转。\n"
+            "添加：在代码行上右键 → 添加锚点…（也可以删除本行锚点）\n"
+            "锚点只是书签，**不会改动你的代码**，也不会让文件变成「已修改」。")
+        self.btn_anchor.clicked.connect(self.show_anchors)
         self.btn_check = QPushButton("检查 (F5)")
         self.btn_check.setDefault(True)
         self.btn_run = QPushButton("运行 (F9)")
@@ -1137,19 +1324,32 @@ class MainWindow(QMainWindow):
         for label, code in ENCODINGS:
             self.cmb_enc.addItem(label, code)
 
+        # 工具栏紧凑化：按钮/输入框统一压到一行文字 + 6px 的高度。
+        # 高度按字体度量算，而不是写死像素 —— 系统缩放到 125%/150% 时不会把字切掉。
+        _h = self.fontMetrics().height() + 6
+        _css = ("QPushButton{padding:0 9px;}"
+                "QSpinBox,QComboBox{padding:0 4px;}"
+                "QCheckBox{spacing:3px;}")
+        for _w in (self.btn_new, self.btn_save, self.btn_align, self.btn_ai_fix,
+                   self.btn_compare, self.btn_anchor, self.btn_check, self.btn_run,
+                   self.spin_timeout, self.cmb_depth, self.chk_ai, self.cmb_enc):
+            _w.setStyleSheet(_css)
+            _w.setFixedHeight(_h)
+
         bar.addWidget(self.btn_new)
         bar.addWidget(self.btn_save)
         bar.addWidget(self.btn_align)
         bar.addWidget(self.btn_ai_fix)
         bar.addWidget(self.btn_compare)
-        bar.addSpacing(12)
+        bar.addWidget(self.btn_anchor)
+        bar.addSpacing(8)
         bar.addWidget(self.btn_check)
         bar.addWidget(self.btn_run)
         bar.addWidget(self.spin_timeout)
         bar.addStretch(1)
         bar.addWidget(self.cmb_depth)
         bar.addWidget(self.chk_ai)
-        bar.addSpacing(12)
+        bar.addSpacing(8)
         bar.addWidget(QLabel("编码："))
         bar.addWidget(self.cmb_enc)
         layout.addLayout(bar)
@@ -1163,13 +1363,24 @@ class MainWindow(QMainWindow):
         self.tabbar.setElideMode(Qt.ElideRight)
         self.tabbar.setUsesScrollButtons(True)
         self.tabbar.setToolTip("点标签切换文件；× 关闭当前标签")
+        # 标签本身也压矮：默认标签高度会吃掉将近一行代码的纵向空间
+        self.tabbar.setStyleSheet(
+            "QTabBar::tab{padding:2px 9px;margin:0 1px 0 0;}")
         self.tabbar.currentChanged.connect(self._on_tab_changed)
         self.tabbar.tabCloseRequested.connect(self._close_doc)
-        layout.addWidget(self.tabbar)
 
+        # 文件路径和标签栏并排一行：路径不再单独占一行高度。
+        # 用 Ignored 策略，标签多的时候路径自动让位截断，不会把标签挤出去。
         self.lbl_file = QLabel("")
-        self.lbl_file.setStyleSheet("color:#4B5563;")
-        layout.addWidget(self.lbl_file)
+        self.lbl_file.setStyleSheet("color:#6B7280;font-size:8pt;")
+        self.lbl_file.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.lbl_file.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        tabrow = QHBoxLayout()
+        tabrow.setContentsMargins(0, 0, 0, 0)
+        tabrow.setSpacing(8)
+        tabrow.addWidget(self.tabbar, 0)
+        tabrow.addWidget(self.lbl_file, 1)
+        layout.addLayout(tabrow)
 
         splitter = QSplitter(Qt.Vertical)
         splitter.addWidget(self.editor.widget)
@@ -1191,7 +1402,7 @@ class MainWindow(QMainWindow):
         self.txt_input = QPlainTextEdit()
         self.txt_input.setPlaceholderText(
             "程序用到 scanf / gets 时，把要输入的内容填在这里（每行一个，按运行时的顺序）")
-        self.txt_input.setFixedHeight(52)
+        self.txt_input.setFixedHeight(44)
         self.txt_input.setFont(QFont("Consolas", 10))
         inrow.addWidget(self.txt_input, 1)
         rl.addLayout(inrow)
@@ -1207,7 +1418,11 @@ class MainWindow(QMainWindow):
         # 缩放的事件过滤器挂在 QApplication 上（见 __init__），
         # 这样无论焦点在编辑器还是输出区都能生效。
         splitter.addWidget(self.tabs)
-        splitter.setSizes([460, 380])
+        # 代码区优先：默认就把大头给编辑器，窗口变大时多出来的空高也主要给它。
+        splitter.setStretchFactor(0, 4)
+        splitter.setStretchFactor(1, 1)
+        self.tabs.setMinimumHeight(110)
+        splitter.setSizes([640, 190])
         layout.addWidget(splitter, 1)
         self.setCentralWidget(central)
 
@@ -1600,6 +1815,264 @@ class MainWindow(QMainWindow):
         if self.cur >= 0:
             self._close_doc(self.cur)
 
+    # ---------- 锚点（书签） ----------
+    # 右键菜单里的命令。id 必须唯一，label 直接显示在菜单上。
+    # 菜单本身是网页里自己画的（全中文），这些命令挂在编辑器上，点了回到这里处理。
+    CTX_ACTIONS = (
+        ("ctutor_cut", "剪切"),
+        ("ctutor_copy", "复制"),
+        ("ctutor_paste", "粘贴"),
+        ("ctutor_delete", "删除"),
+        ("ctutor_selectall", "全选"),
+        ("ctutor_anchor_add", "添加锚点…"),
+        ("ctutor_anchor_list", "锚点列表…"),
+        ("ctutor_anchor_del", "删除本行锚点"),
+        ("ctutor_undo", "撤销"),
+        ("ctutor_redo", "重做"),
+    )
+
+    def _install_editor_actions(self):
+        """把锚点命令挂到编辑器右键菜单（只挂一次）。"""
+        if getattr(self, "_editor_actions_done", False) or not self.editor.monaco:
+            return
+        done = 0
+        for aid, label in self.CTX_ACTIONS:
+            if self.editor.add_context_action(aid, label):
+                done += 1
+        self._editor_actions_done = done == len(self.CTX_ACTIONS)
+        # 页面就绪后补画一次锚点：恢复上次进度是在窗口构造时做的，
+        # 那时候 Monaco 还没加载完，early 的那次 set_anchors 会被丢掉。
+        self._sync_anchors()
+
+    def _on_editor_action(self, action_id):
+        """右键菜单里的命令被点了。"""
+        if action_id == "ctutor_anchor_add":
+            self.editor.cursor_info(self._anchor_add_from_cursor)
+        elif action_id == "ctutor_anchor_list":
+            self.show_anchors()
+        elif action_id == "ctutor_anchor_del":
+            self.editor.cursor_info(self._anchor_del_from_cursor)
+        elif action_id in ("ctutor_cut", "ctutor_copy"):
+            self._editor_copy(cut=(action_id == "ctutor_cut"))
+        elif action_id == "ctutor_paste":
+            self._editor_paste()
+        elif action_id == "ctutor_delete":
+            self.editor.eval_js("window.__ctutor_do('delete')")
+        elif action_id == "ctutor_selectall":
+            self.editor.eval_js("window.__ctutor_do('selectall')")
+        elif action_id in ("ctutor_undo", "ctutor_redo"):
+            self.editor.eval_js("window.__ctutor_do('%s')" % action_id.split("_", 1)[1])
+
+    def _editor_copy(self, cut=False):
+        """复制/剪切：文字从编辑器取出来，放进系统剪贴板。"""
+        def _got(raw):
+            try:
+                text = json.loads(raw) if raw else ""
+            except (ValueError, TypeError):
+                text = ""
+            if not text:
+                return
+            QApplication.clipboard().setText(text)
+            if cut:
+                self.editor.eval_js("window.__ctutor_do('delete')")
+        self.editor.eval_js("window.__ctutor_do('seltext')", _got)
+
+    def _editor_paste(self):
+        """粘贴：系统剪贴板里的文字插到光标/选区处。"""
+        text = QApplication.clipboard().text() or ""
+        if not text:
+            return
+        self.editor.eval_js("window.__ctutor_do('insert', %s)" % json.dumps(text))
+
+    def _anchor_add_from_cursor(self, raw):
+        try:
+            info = json.loads(raw or "{}")
+        except ValueError:
+            info = {}
+        self.add_anchor(int(info.get("line") or 1), info.get("text") or "", ask=True)
+
+    def add_anchor(self, line, text="", name=None, ask=False):
+        """加一个锚点。ask=True 时弹框问名字（右键入口走这条）。
+
+        注意：这里**不碰编辑器里的文本**，也不把文档标成已修改 ——
+        锚点是书签，不是代码。它只影响显示，以及存在会话文件里跨重启保留。
+        """
+        d = self._doc()
+        if d is None:
+            return None
+        line = max(1, int(line))
+        if ask or name is None:
+            default = (text or "").strip()[:24] or ("第 %d 行" % line)
+            name, ok = QInputDialog.getText(
+                self, "添加锚点", "给这个锚点起个名字（跳转时靠它认路）：", text=default)
+            if not ok:
+                return None
+        name = (name or "").strip() or ("第 %d 行" % line)
+        snippet = (text or "").strip()[:80]
+        for a in d.anchors:
+            if int(a.get("line") or 0) == line:          # 同一行只留一个
+                a["name"], a["text"] = name, snippet
+                break
+        else:
+            d.anchors.append({"name": name, "line": line, "text": snippet})
+        d.anchors.sort(key=lambda a: int(a.get("line") or 0))
+        self._sync_anchors()
+        self._save_session()                  # 锚点不进 .c 文件，但下次打开要还在
+        self.status.showMessage("已加锚点「%s」（第 %d 行）" % (name, line), 4000)
+        return name
+
+    def _anchor_del_from_cursor(self, raw):
+        try:
+            info = json.loads(raw or "{}")
+        except ValueError:
+            info = {}
+        n = self.remove_anchors_at(int(info.get("line") or 1))
+        self.status.showMessage(
+            ("已删除 %d 个锚点" % n) if n else "这一行没有锚点", 4000)
+
+    def remove_anchors_at(self, line):
+        d = self._doc()
+        if d is None:
+            return 0
+        before = len(d.anchors)
+        d.anchors = [a for a in d.anchors if int(a.get("line") or 0) != int(line)]
+        n = before - len(d.anchors)
+        if n:
+            self._sync_anchors()
+            self._save_session()
+        return n
+
+    def anchors(self):
+        """当前标签的锚点列表（只读副本，给对话框/测试用）。"""
+        d = self._doc()
+        return list(d.anchors) if d is not None else []
+
+    def _sync_anchors(self):
+        """把当前标签的锚点画到编辑器上（纯装饰，一个字符都不改）。"""
+        try:
+            self.editor.set_anchors(self.anchors())
+        except Exception:                                       # noqa: BLE001
+            pass
+
+    def show_anchors(self):
+        """锚点列表：跳转 / 重命名 / 删除。"""
+        while True:
+            items = self.anchors()
+            dlg = AnchorDialog(items, self)
+            dlg.exec()
+            if dlg.action == "" or dlg.index < 0 or dlg.index >= len(items):
+                return
+            target = items[dlg.index]
+            line = int(target.get("line") or 1)
+            if dlg.action == "goto":
+                self.editor.goto_anchor(line)
+                self.status.showMessage("跳到「%s」（第 %d 行）" % (
+                    target.get("name") or "锚点", line), 4000)
+                return
+            if dlg.action == "delete":
+                doc = self._doc()
+                if doc is not None:
+                    doc.anchors = [a for a in doc.anchors if a is not target]
+                    self._sync_anchors()
+                    self._save_session()
+            elif dlg.action == "rename":
+                new, ok = QInputDialog.getText(
+                    self, "重命名锚点", "新名字：", text=str(target.get("name") or ""))
+                if ok and new.strip():
+                    target["name"] = new.strip()
+                    self._sync_anchors()
+                    self._save_session()
+
+    # ---------- 右键菜单汉化的兜底 ----------
+    @staticmethod
+    def ctx_menu_dump_path() -> str:
+        return os.path.join(tempfile.gettempdir(), "ctutor-ctxmenu-dump.txt")
+
+    def _ctx_menu_watch(self):
+        """每 0.7 秒看一眼右键菜单。
+
+        网页里的菜单由注入脚本翻译（它自己轮询），这里管两件它管不了的事：
+          1. 万一弹的是 **Qt 原生菜单**（WebEngine 自己的），QAction 文案也换成中文；
+          2. 把第一次见到的真实菜单存一份到临时目录，方便出问题时对着真结构改，
+             而不是靠猜 DOM。
+        """
+        # 窗口已经关了/还没显示就别查了，否则会往已释放的页面上跑 JS
+        try:
+            if not self.isVisible():
+                return
+        except Exception:                                       # noqa: BLE001
+            return
+        # ---- 1. Qt 原生菜单（一直查：这一步很便宜）----
+        try:
+            pop = QApplication.activePopupWidget()
+        except Exception:                                       # noqa: BLE001
+            pop = None
+        if pop is not None and hasattr(pop, "actions"):
+            n = 0
+            texts = []
+            for act in pop.actions():
+                try:
+                    texts.append(act.text())
+                except Exception:                               # noqa: BLE001
+                    continue
+                raw = (act.text() or "").replace("&", "").strip()
+                zh = editorui_mod.MENU_ZH.get(raw)
+                if zh and act.text() != zh:
+                    act.setText(zh)
+                    n += 1
+            if n:
+                self._ctx_dump_done = True
+                self._write_ctx_dump("Qt 原生菜单", texts)
+            return
+        # ---- 2. 网页菜单的现场快照（只在前 3 分钟查，之后不再打扰）----
+        if self._ctx_dump_done or not self.editor.monaco or self._ctx_js_ticks > 240:
+            return
+        self._ctx_js_ticks += 1
+        self.editor.eval_js(
+            "JSON.stringify({html: window.__ctutor_menu_dump || '',"
+            " labels: window.__ctutor_menu_labels || []})",
+            self._ctx_menu_dump_ready)
+
+    def _ctx_menu_dump_ready(self, raw):
+        try:
+            data = json.loads(raw or "{}")
+        except ValueError:
+            return
+        html_text = data.get("html") or ""
+        if not html_text:
+            return
+        self._ctx_dump_done = True
+        self._write_ctx_dump("网页菜单（.monaco-menu）", data.get("labels") or [],
+                             html_text)
+
+    def _write_ctx_dump(self, kind, labels, html_text=""):
+        """把菜单现场写进临时目录（只写第一次，保留最有价值的那份）。
+
+        这是给自己排查用的：万一还有没翻到的条目，这份 HTML 就是真结构，
+        不用再靠猜。文件在系统临时目录，不进仓库、不影响使用。
+        """
+        try:
+            path = self.ctx_menu_dump_path()
+            if os.path.exists(path):
+                return                      # 保留第一次的快照
+            plain = [(s or "").replace("&", "").strip() for s in labels]
+            left = [s for s in plain if s and not any("\u4e00" <= ch <= "\u9fff" for ch in s)]
+            lines = [
+                "时间: %s" % time.strftime("%Y-%m-%d %H:%M:%S"),
+                "来源: %s" % kind,
+                "条目数: %d" % len(plain),
+                "仍是英文的条目: %s" % ("(全部已汉化)" if not left else " | ".join(left)),
+                "",
+                "条目:",
+            ]
+            lines += ["  - %s" % s for s in plain]
+            if html_text:
+                lines += ["", "HTML:", html_text]
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines))
+        except OSError:
+            pass
+
     # ---------- 上次进度（会话） ----------
     def _session_snapshot(self):
         """把当前所有标签整理成可保存的普通字典。"""
@@ -1613,6 +2086,9 @@ class MainWindow(QMainWindow):
                 # 否则下次打开只剩一个空标签（文件被挪走后内容就白写了）
                 "text": d.text if (d.modified or not (d.path and os.path.exists(d.path))) else "",
                 "modified": bool(d.modified),
+                # 锚点是书签，跟着标签走；不写进 .c 文件，所以只能存在会话里
+                "anchors": [{"name": a.get("name") or "", "line": int(a.get("line") or 0),
+                             "text": a.get("text") or ""} for a in d.anchors],
             })
         return out
 
@@ -1684,6 +2160,18 @@ class MainWindow(QMainWindow):
                 doc.modified = True
             else:
                 continue
+            # 锚点：老会话里没有这个字段，默认空；坏数据直接忽略，不影响打开文件
+            for a in (it.get("anchors") or []):
+                if not isinstance(a, dict):
+                    continue
+                try:
+                    line = int(a.get("line") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if line > 0:
+                    doc.anchors.append({"name": str(a.get("name") or ""),
+                                        "line": line,
+                                        "text": str(a.get("text") or "")[:80]})
             self.docs.append(doc)
             restored += 1
         if not restored:

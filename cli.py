@@ -21,7 +21,7 @@ from engine.encoding import detect_source_encoding         # noqa: E402
 from engine.kb import KnowledgeBase                         # noqa: E402
 
 ROOT = config_mod.ROOT
-TOOL_VERSION = "0.4.0"
+TOOL_VERSION = "0.5.0"
 REPORT_SCHEMA = "ctutor/report/1"
 
 
