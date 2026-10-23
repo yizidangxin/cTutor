@@ -12,43 +12,9 @@
 
 命令行方式（面板与命令行共用同一套引擎）：
 
-```bash
-python panel.py                      # 启动面板
-python panel.py 你的代码.c            # 直接打开某个文件
-python panel.py --selftest shot.png  # 离屏渲染截图（无人值守验证用）
-
-# 命令行（零第三方依赖，不装 PySide6 也能用）
-python cli.py doctor            # 环境与配置自检（加 --ai 测 DeepSeek 连通性）
-python cli.py kb                # 知识库统计 + Top-20 高频命中率
-
-# 主路径：只解释，不改代码
-python cli.py check 你的代码.c            # 分层讲解（默认 4 层）
-python cli.py check 你的代码.c --brief    # 只给结论
-python cli.py check 你的代码.c --depth 3  # 讲到「原因」为止
-python cli.py check 你的代码.c -o report.json   # 结构化报告（供界面/统计）
-python cli.py check 你的代码.c --ai       # 知识库没收录时让 DeepSeek 补充
-
-python cli.py pending           # 待补清单：未收录的错误码按出现次数排序
-python cli.py fix 你的代码.c --dry-run   # [实验性] 超出定位，默认不用
-```
-
 **依赖情况**：命令行只用标准库；图形面板需要 PySide6 与 qtmonaco
 
-```bash
-pip install -i https://pypi.tuna.tsinghua.edu.cn/simple PySide6 qtmonaco
-```
-
 配置密钥：见下方「如何接入 AI」。**不要把密钥写进代码或提交到仓库。**
-
-## 打包分发给别人
-
-```bash
-python tools/build_package.py                # 完整打包（含便携编译器）
-python tools/build_package.py --no-toolchain # 不捆绑编译器（体积小很多）
-python tools/build_package.py --skip-build   # 跳过 PyInstaller，只重组目录
-```
-
-产物是 _pack/ctutor-<版本>-便携版.zip，对方**解压后双击 ctutor.exe 即可**——不需要装 Python，不需要装编译器，不需要管理员权限，不写注册表。
 
 | 项 | 说明 |
 | --- | --- |
@@ -60,7 +26,7 @@ python tools/build_package.py --skip-build   # 跳过 PyInstaller，只重组目
 
 ## 图形面板
 
-![出错位置标红](docs/screenshots/panel_marks.png)
+![](docs/screenshots/panel_marks.png)
 
 出错位置标红
 
@@ -79,12 +45,13 @@ python tools/build_package.py --skip-build   # 跳过 PyInstaller，只重组目
 - **编码可选**：GBK / UTF-8 / UTF-8+BOM，状态栏显示当前编码
 - **AI 补充**：勾选后仅在本地知识库未收录时调用 DeepSeek
 
+。支持建立锚点；可建立锚点，一键跳转代码片段
 
 ### 一键运行
 
-![运行输出](docs/screenshots/panel_full_run.png)
+![](docs/screenshots/panel_full_run.png)
 
-*程序跑完，输出就在下面的「运行输出」里*
+运行输出
 
 #### 运行代码会遇到的情况
 
@@ -99,9 +66,9 @@ python tools/build_package.py --skip-build   # 跳过 PyInstaller，只重组目
 
 ### 新建文件
 
-![新建文件](docs/screenshots/panel_newproj.png)
+![](docs/screenshots/panel_newproj.png)
 
-*填个名字、选个位置，就能开始写第一个 .c*
+新建文件
 
 Ctrl+N 或工具栏「新建文件」：填文件名、选存放位置、选起始内容，然后得到一个 .c 文件并直接在编辑器里打开。
 
@@ -110,12 +77,7 @@ Ctrl+N 或工具栏「新建文件」：填文件名、选存放位置、选起�
 - 文件名会校验（非法字符、以点或空格结尾等），重名**不会静默覆盖**，先问一句
 - 输入 作业1.c 不会变成 作业1.c.c——后缀由程序统一补
 
-**扁平存放，不套文件夹。** 早期版本会建一个同名文件夹再往里面放 `main.c`：
-
-```
-改之前： ctutor项目 / 第一次作业 / main.c      ← 要进两层才找到
-现在  ： ctutor项目 / 第一次作业.c             ← 一眼看到
-```
+**扁平存放，不套文件夹。** 早期版本会建一个同名文件夹再往里面放 main.c：
 
 ### 关掉也不会丢（上次进度）
 
@@ -136,9 +98,9 @@ Ctrl+N 或工具栏「新建文件」：填文件名、选存放位置、选起�
 
 ### 同时开多个文件
 
-![多标签](docs/screenshots/panel_tabs.png)
+![](docs/screenshots/panel_tabs.png)
 
-*可以多开代码，方便对照*
+可以多开代码，方便对照
 
 - 点标签切换，点 × 关闭（Ctrl+W），标签可以拖动排序
 - **各标签互不干扰**：内容、光标、编码、上一轮的标红都各自保存
@@ -153,7 +115,7 @@ Ctrl+N 或工具栏「新建文件」：填文件名、选存放位置、选起�
 
 ### AI 修改：让模型给一份能编译的代码
 
-![AI 修改三种方式](docs/screenshots/panel_v3.png)
+![](docs/screenshots/panel_v3.png)
 
 工具栏「AI 修改」会先问你**想怎么看改了什么**，三种方式：
 
