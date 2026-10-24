@@ -12,15 +12,33 @@
 当某一层来自 AI 时会明确标注——这是 CodeAid 设计原则 D4（透明度与学生可控）的落地。
 默认深度 4；将来做「苏格拉底模式」只需把默认深度降到 3，结构不用改。
 """
-from typing import Any, Dict, List, Optional, Tuple
+import html as _html
+import re as _re
+from typing import Any, Dict, List, Tuple
 
-from .encoding import caret_line, char_col, encoding_label
+from .encoding import caret_line, encoding_label
 from .explain import Explanation
 
 LAYERS = ("结论", "定位", "原因", "改法", "知识点")
 DEFAULT_DEPTH = 4
 WIDTH = 66
 SEP = "─" * WIDTH
+
+# 知识库、提示语、AI 讲解里到处是 **加粗** 这种 Markdown 写法。
+# 终端和 HTML 都不认它：终端把 ** 原样打出来，HTML 里更糟——
+# 学生看到「函数没有 return**，所以……**」这种星号，像排版坏了。
+# 在渲染层统一处理一次：纯文本去掉标记，HTML 转成 <b>。
+_EMPH = _re.compile(r"\*\*(.+?)\*\*", _re.S)
+
+
+def _plain(s: str) -> str:
+    """去掉 Markdown 强调标记（终端 / 纯文本用）。"""
+    return _EMPH.sub(r"\1", s)
+
+
+def _emph_html(s: str) -> str:
+    """先转义，再把 **…** 变成 <b>…</b>；内容里夹 HTML 也不会穿透。"""
+    return _EMPH.sub(r"<b>\1</b>", _html.escape(s))
 
 
 def _indent(text: str, prefix: str = "    ") -> str:
@@ -35,10 +53,6 @@ def _as_list(v: Any) -> List[str]:
     if isinstance(v, list):
         return [str(x) for x in v if str(x).strip()]
     return []
-
-
-def _source_line(label: str, text: str, source: str) -> str:
-    return text
 
 
 def layers(exp: Explanation) -> List[Tuple[str, List[str]]]:
@@ -167,7 +181,7 @@ def render_html(exp: Explanation, depth: int = DEFAULT_DEPTH) -> str:
             if not b.strip():
                 out.append('<div style="height:6px"></div>')
                 continue
-            esc = _html.escape(b)
+            esc = _emph_html(b)
             style = "white-space:pre-wrap;word-break:break-word;margin-left:14px;"
             if b.lstrip().startswith("★"):
                 style += "color:#B45309;font-weight:600;"
@@ -184,10 +198,10 @@ def render_html(exp: Explanation, depth: int = DEFAULT_DEPTH) -> str:
                    % rest)
     if exp.ai_meta:
         out.append('<div style="margin-top:8px;color:#6B7280;font-size:9.5pt;">'
-                   'AI 补充：%s</div>' % _html.escape(exp.ai_meta))
+                   'AI 补充：%s</div>' % _emph_html(exp.ai_meta))
     for note in exp.ai_notes:
         out.append('<div style="color:#6B7280;font-size:9.5pt;">守卫：%s</div>'
-                   % _html.escape(note))
+                   % _emph_html(note))
     out.append('</div>')
     return "".join(out)
 
@@ -202,12 +216,12 @@ def render(exp: Explanation, depth: int = DEFAULT_DEPTH, width: int = WIDTH) -> 
             lines.append("")
         lines.append("【%d %s】" % (idx + 1, title))
         if idx == 0:
-            lines.append("  " + body[0])
+            lines.append("  " + _plain(body[0]))
             for b in body[1:]:
-                lines.append(_indent(b, "  "))
+                lines.append(_indent(_plain(b), "  "))
         else:
             for b in body:
-                lines.append(_indent(b, "  ") if b.strip() else "")
+                lines.append(_indent(_plain(b), "  ") if b.strip() else "")
     if depth < len(LAYERS):
         remaining = "、".join("%d %s" % (i + 1, LAYERS[i]) for i in range(depth, len(LAYERS)))
         lines.append("")

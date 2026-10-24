@@ -8,8 +8,7 @@
 因此本模块负责：① 猜测源文件编码；② 把编译器输出（编码不稳定）稳健解码。
 """
 import codecs
-import os
-from typing import List, Optional
+from typing import List
 
 CANDIDATES = ("utf-8", "mbcs", "oem", "latin-1")
 
@@ -23,6 +22,18 @@ def encoding_label(enc: str) -> str:
         "mbcs": "GBK（中文 Windows 的 ANSI 代码页）",
         "oem": "OEM 代码页",
     }.get(enc, enc)
+
+
+def _normalize(name: str) -> str:
+    """把常见编码别名归一（程序输出解码用）。"""
+    n = (name or "").strip().lower().replace("-", "").replace("_", "")
+    if n in ("utf8", "utf8bom", "utf8sig"):
+        return "utf-8"
+    if n in ("gbk", "gb2312", "gb18030", "cp936", "936", "ansi"):
+        return "gbk"
+    if n in ("big5", "cp950"):
+        return "big5"
+    return n or "utf-8"
 
 
 def smart_decode(data: bytes) -> str:
@@ -42,6 +53,32 @@ def smart_decode(data: bytes) -> str:
             if bad == 0:
                 break
     return best if best is not None else data.decode("utf-8", errors="replace")
+
+
+def decode_output(raw: bytes, prefer: str = "utf-8") -> str:
+    """解码程序输出。
+
+    顺序很讲究：**先严格试 UTF-8**，失败再按源码编码/GBK 兜底。
+
+    为什么不能"按源码编码优先"：GBK 的字节空间很宽，几乎任何字节序列都能解出某个
+    结果，所以"GBK 解成功了"根本不是证据。反过来 UTF-8 校验很严，
+    一个 GBK 编码的中文串几乎不可能碰巧是合法 UTF-8。所以 UTF-8 严格通过基本就是它。
+    （实测：按源码编码优先时，程序输出的中文会变成 תȦ 这样的乱码。）
+    """
+    if not raw:
+        return ""
+    prefer = _normalize(prefer)
+    order = ["utf-8"]
+    for enc in (prefer, "gbk", "cp936", "big5"):
+        if enc and enc.lower() not in [o.lower() for o in order]:
+            order.append(enc)
+    order.append("latin-1")
+    for enc in order:
+        try:
+            return raw.decode(enc)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return raw.decode("utf-8", errors="replace")
 
 
 def detect_source_encoding(path: str) -> str:

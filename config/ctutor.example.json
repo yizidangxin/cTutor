@@ -12,7 +12,7 @@
   "ai": {
     "//": "密钥不要写在这里。用环境变量 DEEPSEEK_API_KEY，或写在用户目录（见 README）。",
     "enabled": false,
-    "model": "deepseek-flash",
+    "model": "deepseek-chat",
     "timeout_seconds": 45,
     "max_retries": 1
   },

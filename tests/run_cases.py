@@ -22,7 +22,6 @@ sys.path.insert(0, ROOT)
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 from engine import compilers, explain, render              # noqa: E402
-from engine.diagnostic import first_error                   # noqa: E402
 from engine.kb import KnowledgeBase                         # noqa: E402
 
 CASES_DIR = os.path.join(HERE, "cases")

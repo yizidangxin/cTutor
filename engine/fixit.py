@@ -10,11 +10,9 @@ expressed as a **count of bytes**, starting at byte 1 for the initial column.
 （我们同时给 GCC 传了 -fdiagnostics-column-unit=byte 保持一致）。
 """
 import difflib
-import os
-from typing import List, Optional, Tuple
+from typing import List, Tuple
 
 from .diagnostic import FixIt
-from .encoding import detect_source_encoding
 
 
 class ApplyResult:
@@ -59,34 +57,6 @@ def apply_fixits_to_bytes(data: bytes, fixits: List[FixIt], encoding: str = "utf
         lines[idx] = line
 
     return ApplyResult(applied > 0, b"\n".join(lines), applied, skipped)
-
-
-def apply_fixits_to_file(src: str, fixits: List[FixIt], dst: Optional[str] = None,
-                         inplace: bool = False) -> Tuple[ApplyResult, str, str]:
-    """返回 (结果, 输出路径, diff 文本)。默认写副本，绝不直接改原文件。"""
-    enc = detect_source_encoding(src)
-    with open(src, "rb") as f:
-        original = f.read()
-    res = apply_fixits_to_bytes(original, fixits, enc)
-    out = src if inplace else (dst or src + ".fixed.c")
-    if res.changed and not inplace:
-        with open(out, "wb") as f:
-            f.write(res.data)
-    elif res.changed and inplace:
-        with open(out, "wb") as f:
-            f.write(res.data)
-
-    def dec(b):
-        try:
-            return b.decode(enc)
-        except (UnicodeDecodeError, LookupError):
-            return b.decode("utf-8", errors="replace")
-
-    diff = "".join(difflib.unified_diff(
-        dec(original).splitlines(True), dec(res.data).splitlines(True),
-        fromfile=os.path.basename(src) + "（原始）",
-        tofile=os.path.basename(out) + "（修复后）"))
-    return res, out, diff
 
 
 def unified_diff_bytes(a: bytes, b: bytes, name: str, enc: str = "utf-8") -> str:

@@ -26,6 +26,11 @@ from engine import config as _config_mod                      # noqa: E402
 from engine import session as _session_mod                    # noqa: E402
 _config_mod.user_config_path = lambda: os.path.join(_TEST_DIR, "config.json")
 
+
+def _tmp_path(name):
+    """测试用的临时文件路径（都放在 _TEST_DIR 里，不碰真项目目录）。"""
+    return os.path.join(_TEST_DIR, name)
+
 # 默认标记"说明已看过"，否则每个 MainWindow 都会在 0.9 秒后自动弹说明窗口，
 # 把后面所有断言搅乱。专门测"首次启动自动弹"的那一段会自己把它改回 False。
 try:
@@ -335,6 +340,22 @@ html2 = win3.view_run.toHtml()
 check("正常运行时：显示输出内容", "sum=7" in html2, html2[:200])
 check("正常运行时：显示用时", "用时" in html2)
 
+# 实时输出：程序还在跑时就把输出贴上来（不再等跑完一次性刷）
+win3._run_streamed = False
+win3.view_run.setPlainText("正在编译并运行…\n")
+win3._on_run_chunk("第一行\n")
+win3._on_run_chunk("第二行\n")
+body = win3.view_run.toPlainText()
+check("实时输出：一有输出就贴进「运行输出」页",
+      "第一行" in body and "第二行" in body, body[:80])
+check("实时输出：第一块到达时就清掉「正在编译并运行…」",
+      "正在编译" not in body, body[:80])
+win3._on_run_done(run_mod.RunResult(compiled=True, ok=True, exit_code=0,
+                                    stdout="第一行\n第二行\n", duration=0.3))
+body2 = win3.view_run.toPlainText()
+check("实时输出结束后只补小结、不重画已有内容",
+      "第一行" in body2 and "运行结束" in body2, body2[:120])
+
 # 超时
 win3._on_run_done(run_mod.RunResult(compiled=True, ok=False, timed_out=True,
                                     exit_code=-9, duration=10.0))
@@ -479,9 +500,14 @@ view_menu = menu_items("视图")
 check("缩放收进了「视图」菜单（原先错放在「检查」菜单里）",
       any("放大" in t for t in view_menu) and not any("放大" in t for t in run_menu),
       (run_menu, view_menu))
-check("「运行」菜单同时提供系统命令行与面板内两种方式",
-      any("系统命令行" in t for t in run_menu) and any("面板内" in t for t in run_menu),
+check("「运行」菜单只在面板里跑，不再提供开黑框的系统命令行方式",
+      any("运行" in t for t in run_menu) and not any("系统命令行" in t for t in run_menu),
       run_menu)
+check("运行按钮的提示里写明「不会弹黑色命令行窗口」",
+      "不" in win3.btn_run.toolTip() and "命令行窗口" in win3.btn_run.toolTip(),
+      win3.btn_run.toolTip())
+check("只剩一条运行路径（系统命令行那套入口已删除）",
+      not hasattr(win3, "do_run_panel"))
 check("文件菜单有新建文件与设置存放位置",
       any("新建文件" in t for t in menu_items("文件"))
       and any("存放位置" in t for t in menu_items("文件")),
@@ -1034,6 +1060,132 @@ check("panel.py 对 stdout=None 有防护（pythonw 启动必需）",
       "if _stream is not None" in src, "")
 check("panel.py 注册了崩溃处理器（无控制台时不会静默失败）",
       "_install_crash_handler" in src)
+
+# ---------------------------------------------------------------- 输入框与分割条
+print()
+print("— 程序输入框 / 分割条 —")
+win4 = panel.MainWindow()
+win4.show()
+for _ in range(4):
+    app.processEvents()
+
+d1 = panel.Doc(text="int main(void){return 0;}\n", label="甲.c", path=_tmp_path("jia.c"))
+d2 = panel.Doc(text="int main(void){return 0;}\n", label="乙.c", path=_tmp_path("yi.c"))
+win4.docs = [d1, d2]
+win4.cur = 0
+win4._sync_tabs()
+win4._push_current_to_editor(d1)
+for _ in range(3):
+    app.processEvents()
+
+win4.txt_input.setPlainText("111")
+win4._activate(1)
+for _ in range(3):
+    app.processEvents()
+check("切到另一个项目：输入框不会带着上个项目的数",
+      win4.txt_input.toPlainText() == "", win4.txt_input.toPlainText())
+
+win4.txt_input.setPlainText("222")
+win4._activate(0)
+for _ in range(3):
+    app.processEvents()
+check("切回原项目：自己填过的输入还在", win4.txt_input.toPlainText() == "111",
+      win4.txt_input.toPlainText())
+check("项目 B 的输入也各存各的", win4.docs[1].input_text == "222", win4.docs[1].input_text)
+
+check("有「发送」按钮（半交互：运行中逐行喂输入）",
+      hasattr(win4, "btn_send_input") and win4.btn_send_input.text().startswith("发送"),
+      getattr(win4, "btn_send_input", None))
+check("没在运行时「发送」按钮是灰的", not win4.btn_send_input.isEnabled())
+win4._send_input()          # 不该崩，也不该往哪儿送
+check("没在运行时按发送：只提示，不崩",
+      "没在运行" in win4.status.currentMessage(), win4.status.currentMessage())
+
+check("分割条抓握区加宽了（默认 4px 几乎按不中）",
+      win4.splitter.handleWidth() >= 20, win4.splitter.handleWidth())
+h4 = win4.splitter.handle(1)
+check("分割条悬停有反馈（QSS 里带 hover 配色）",
+      "hover" in win4.splitter.styleSheet(), win4.splitter.styleSheet()[:60])
+check("分割条高度就是抓握区高度", h4.height() >= 20, h4.height())
+
+# 「结束输入」：程序卡在"读到 EOF 才走"时，学生不用等超时
+from PySide6.QtCore import Qt as _Qt                          # noqa: E402
+
+
+class _StubWorker:
+    """冒充正在运行的 RunWorker：只记录界面发过来的东西，不真的编译。"""
+
+    def __init__(self):
+        self.lines = []
+        self.eofs = 0
+
+    def isRunning(self):
+        return True
+
+    def send(self, text):
+        self.lines.append(text)
+
+    def end_input(self):
+        self.eofs += 1
+        return True
+
+
+check("「结束输入」按钮就挂在「运行输出」页签右边",
+      win4.tabs.cornerWidget(_Qt.TopRightCorner) is win4.btn_end_input)
+check("按钮说明里写了回车也能结束输入",
+      "回车" in win4.btn_end_input.toolTip(), win4.btn_end_input.toolTip())
+check("没在运行时「结束输入」是灰的", not win4.btn_end_input.isEnabled())
+
+stub = _StubWorker()
+win4.run_worker = stub
+win4.view_run.setPlainText("")
+win4.txt_input.setPlainText("abc")
+win4._send_input()
+check("运行中回车：把这一行送进程序，并在输出里回显",
+      stub.lines == ["abc"] and "› abc" in win4.view_run.toPlainText(),
+      (stub.lines, win4.view_run.toPlainText()[:40]))
+
+win4.txt_input.clear()
+win4._send_input()
+check("输入框空着回车 = 结束输入（不用去找按钮）",
+      stub.eofs == 1 and "已结束输入" in win4.view_run.toPlainText(),
+      (stub.eofs, win4.view_run.toPlainText()[-40:]))
+check("结束输入后两个按钮都收起（再点也送不进去了）",
+      not win4.btn_send_input.isEnabled() and not win4.btn_end_input.isEnabled())
+
+check("没在运行时点「结束输入」：只提示，不崩",
+      "没在运行" in (win4._end_input() or win4.status.currentMessage()))
+win4.run_worker = None
+
+# 运行中突然不出声：多半是停在 scanf 上等人输入，要主动提示
+stub2 = _StubWorker()
+win4.run_worker = stub2
+win4.view_run.setPlainText("")
+win4._idle_hint_shown = False
+win4._last_chunk_at = time.time() - 10
+win4._tick_run_watch()
+body_hint = win4.view_run.toPlainText()
+check("运行中憋了几秒没输出：提示「可能在等 scanf」",
+      "等 scanf" in body_hint, body_hint[-80:])
+win4._tick_run_watch()
+check("这个提示只出现一次（不刷屏）", win4.view_run.toPlainText() == body_hint)
+win4._run_watch.stop()
+win4.run_worker = None
+
+_timeout_res = run_mod.RunResult(compiled=True, ok=False, exit_code=-9,
+                                 timed_out=True, duration=10.0,
+                                 stdout="输入位数\n")
+win4._on_run_done(_timeout_res)
+check("超时的状态栏不再武断说「多半是死循环」",
+      "等输入" in win4.status.currentMessage(), win4.status.currentMessage())
+check("超时后页面没有崩（结尾小结补在最后）",
+      "超时" in win4.view_run.toPlainText(), win4.view_run.toPlainText()[-60:])
+
+_w = panel.RunWorker(_tmp_path("x.c"), "", "utf-8", None, 10, None)
+check("EOF 只送一次（重复点不会提前关掉管道）",
+      _w.end_input() is True and _w.end_input() is False)
+_w.deleteLater()
+
 
 n_fail = sum(1 for _, ok in results if not ok)
 print()

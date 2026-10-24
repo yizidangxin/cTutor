@@ -42,7 +42,7 @@ DEFAULTS: Dict[str, Any] = {
     "ai": {
         "enabled": False,              # 默认关闭：本地层零成本零延迟
         "api_key": "",                 # 建议放用户配置而不是项目里（面板的「设置密钥」会写用户配置）
-        "model": "deepseek-flash",
+        "model": "deepseek-chat",
         "base_url": "https://api.deepseek.com",
         "timeout_seconds": 45,
         "max_retries": 1,
@@ -172,20 +172,6 @@ def longest_path_under(root: str, stop_at: int = 250) -> int:
     except OSError:
         pass
     return longest
-
-
-def path_advice(root: str = None, limit: int = 250) -> str:
-    """路径过长时给出可操作的建议；正常时返回空串。"""
-    root = root or ROOT
-    longest = longest_path_under(root, limit)
-    if longest <= limit:
-        return ""
-    return (
-        "当前程序所在路径已经很长（最长文件路径 %d 字符，Windows 上限 260），\n"
-        "可能出现解压缺文件、打不开、或编译失败等问题。\n\n"
-        "请把整个程序文件夹移动到一个**短且纯英文**的目录，例如：\n"
-        "    D:\\ctutor\n\n"
-        "当前位置：%s" % (longest, root))
 
 
 def ensure_dirs(cfg: Dict[str, Any] = None) -> None:

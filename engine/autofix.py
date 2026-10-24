@@ -11,8 +11,7 @@
 （单测里 `int a; // 说明；备注` 被吃成 `int a; /`），这类 bug 在纯代码用例上
 是看不出来的，因此单测必须覆盖注释场景。
 """
-import os
-from typing import List, Optional, Tuple
+from typing import List, Tuple
 
 from .hints import FULLWIDTH
 
@@ -112,27 +111,3 @@ def fix_text(text: str) -> Tuple[str, List[Tuple[int, int, str, str]]]:
             continue
 
     return "".join(out), replaced
-
-
-def fix_file(src: str, dst: Optional[str] = None, inplace: bool = False,
-             encoding: Optional[str] = None):
-    """修复文件代码区中的全角标点。默认写副本，不会改原文件。
-
-    返回 (是否修改, 输出路径, 被替换的位置列表)。
-    """
-    from .encoding import detect_source_encoding
-    enc = encoding or detect_source_encoding(src)
-    with open(src, "rb") as f:
-        raw = f.read()
-    try:
-        text = raw.decode(enc)
-    except (UnicodeDecodeError, LookupError):
-        enc = "utf-8"
-        text = raw.decode("utf-8", errors="replace")
-
-    new_text, replaced = fix_text(text)
-    out = src if inplace else (dst or src + ".fixed.c")
-    if replaced:
-        with open(out, "wb") as f:
-            f.write(new_text.encode(enc, errors="replace"))
-    return bool(replaced), out, replaced

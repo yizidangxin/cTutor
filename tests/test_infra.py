@@ -305,7 +305,7 @@ check("端到端：key_source 指明来自用户配置", "用户配置" in ai_mo
       ai_mod.key_source())
 
 # 还原环境与配置
-config_mod.save_user_config({"ai": {"api_key": "", "model": "deepseek-flash"}})
+config_mod.save_user_config({"ai": {"api_key": "", "model": "deepseek-chat"}})
 if _old_appdata is None:
     os.environ.pop("APPDATA", None)
 else:

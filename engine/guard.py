@@ -105,7 +105,9 @@ def sanitize_fix(text: str) -> Tuple[str, bool]:
         kept = [ln for ln in cleaned.split("\n")
                 if ln.strip() and not _C_LIKE.search(ln)]
         if kept:
-            cleaned = "".join(kept).replace("  ", " ").strip()
+            # 用空格拼：以前是 "" .join，两行说明会被粘成一句
+            #（"少了分号" + "把它补上" → "少了分号把它补上"），读起来像病句。
+            cleaned = " ".join(ln.strip() for ln in kept).replace("  ", " ").strip()
         else:
             cleaned = "（这条修改涉及整段代码，为避免直接给出答案，此处只描述位置与思路）"
     return cleaned, True

@@ -13,7 +13,9 @@ import urllib.error
 import urllib.request
 
 DEFAULT_BASE = "https://api.deepseek.com"
-DEFAULT_MODEL = "deepseek-flash"        # 便宜 4–7 倍、并发 2500，见方案第八节
+# 官方 API 的通用对话模型 id 就是 deepseek-chat（另有 deepseek-reasoner 走推理）。
+# 早期这里写的是 deepseek-flash 这个别名，换回官方名以免请求 400。
+DEFAULT_MODEL = "deepseek-chat"
 
 
 class AIError(Exception):

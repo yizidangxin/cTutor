@@ -16,8 +16,11 @@ from .diagnostic import Diagnostic, FixIt
 
 # MSVC:  C:\a\b.c(5): error C2146: 语法错误: 缺少“;”(在标识符“printf”的前面)
 # MSVC:  C:\a\b.c(5,7): warning C4477: ...
+# 文件部分用 .+? 而不是 [^()]+?：路径里合法地可能出现括号
+# （C:\Program Files (x86)\、学生杂项里的「作业 (1)」），用 [^()]+? 会直接匹配失败、
+# 整条诊断被丢掉——表现为"编译报错，但工具说没发现错误"。
 _MSVC_DIAG = re.compile(
-    r"^(?P<file>[^()]+?)\((?P<line>\d+)(?:,(?P<col>\d+))?\)\s*:\s*"
+    r"^(?P<file>.+?)\((?P<line>\d+)(?:,(?P<col>\d+))?\)\s*:\s*"
     r"(?P<level>fatal error|error|warning|note)\s+"
     r"(?P<code>[A-Z]{1,4}\d{3,5})\s*:\s*(?P<msg>.*)$"
 )
@@ -27,8 +30,10 @@ _MSVC_LINK = re.compile(
     r"(?P<code>LNK\d{4}|D\d{4})\s*:\s*(?P<msg>.*)$"
 )
 # GCC/Clang:  a.c:5:7: error: expected ';' before '}' token [-Werror=...]
+# 文件名同样不能用 [^:]+：Windows 绝对路径 C:\a\b.c 里就有冒号，
+# 那样会把 "C" 当成文件名、整条诊断丢弃。
 _GCC_DIAG = re.compile(
-    r"^(?P<file>[^:]+):(?P<line>\d+):(?P<col>\d+):\s*"
+    r"^(?P<file>.+?):(?P<line>\d+):(?P<col>\d+):\s*"
     r"(?P<level>fatal error|error|warning|note)\s*:\s*(?P<msg>.*?)"
     r"(?:\s*\[(?P<opt>-W[a-zA-Z0-9=_-]+)\])?$"
 )
@@ -38,13 +43,23 @@ _GCC_FIXIT = re.compile(
     r'(?P<rep>(?:[^"\\]|\\.)*)"$'
 )
 
-_UNESCAPE = {"\\\\": "\\", "\\t": "\t", "\\n": "\n", '\\"': '"'}
+_UNESCAPE_RE = re.compile(r"\\(?:([0-7]{1,3})|(.))")
+_UNESCAPE_MAP = {"n": "\n", "t": "\t", "r": "\r", '"': '"', "'": "'", "\\": "\\"}
 
 
 def _unescape(s: str) -> str:
-    for k, v in _UNESCAPE.items():
-        s = s.replace(k, v)
-    return re.sub(r"\\([0-7]{1,3})", lambda m: chr(int(m.group(1), 8)), s)
+    """按 C 字符串字面量语义一次性反转义。
+
+    为什么必须"一次性"：以前的实现按顺序 replace，遇到 `\\\\t`（转义的反斜杠 + t）
+    时先被替换成 `\\t`，再被当成制表符——顺序替换会把字面量吃成控制字符。
+    """
+    def sub(m):
+        oct_part, ch = m.group(1), m.group(2)
+        if oct_part is not None:
+            return chr(int(oct_part, 8))
+        return _UNESCAPE_MAP.get(ch, ch)
+
+    return _UNESCAPE_RE.sub(sub, s)
 
 
 def parse_msvc_text(text: str) -> List[Diagnostic]:

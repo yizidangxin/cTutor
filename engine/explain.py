@@ -142,7 +142,12 @@ def choose_diagnostic(diags: List[Diagnostic], kb: Optional[KnowledgeBase] = Non
     def rank(d):
         code = (d.code or "").upper()
         noise = 1 if code in _LOW_VALUE_WARN else 0
+        # 高价值警告（漏 return、未初始化、格式串错配、= 写成 ==……）优先于
+        # 那些只是"没用到"的提示——即使后者恰好被知识库收录了。
+        # 这条曾经漏掉：_HIGH_VALUE_WARN 定义了却没用，于是排序退化成
+        # "知识库能解释的赢"，正好复现了这条规则的初衷要解决的问题。
+        worth = 0 if code in _HIGH_VALUE_WARN else 1
         unexplained = 0 if (kb is not None and kb.lookup(d)) else 1
-        return (noise, unexplained, d.sort_key())
+        return (noise, worth, unexplained, d.sort_key())
 
     return sorted(warns, key=rank)[0]

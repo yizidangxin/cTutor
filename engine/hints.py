@@ -103,14 +103,53 @@ def looks_mojibake(text: str) -> bool:
     return any(ch in text for ch in markers)
 
 
+def _code_part(line: str) -> str:
+    """取出这一行里"真正是代码"的部分：剔除注释，并剔除字符串/字符字面量内部。
+
+    为什么不能简单 split("//")：
+      · `printf("a // b");` 里字符串内部就有 //，直接截断会把后面的全角分号漏掉；
+      · `printf("你好，世界");` 里的全角逗号是**合法内容**，报出来就是误报——
+        学生照着提示去改，反而把要输出的中文标点改坏了。
+    autofix 早就是这么判断的（只在代码区替换），扫提示这边以前没跟上。
+    """
+    out: List[str] = []
+    i, n = 0, len(line)
+    quote = ""
+    while i < n:
+        ch = line[i]
+        if quote:
+            if ch == "\\" and i + 1 < n:
+                i += 2
+                continue
+            if ch == quote:
+                quote = ""
+            i += 1
+            continue
+        if ch in "\"'":
+            quote = ch
+            i += 1
+            continue
+        if ch == "/" and i + 1 < n and line[i + 1] == "/":
+            break
+        if ch == "/" and i + 1 < n and line[i + 1] == "*":
+            end = line.find("*/", i + 2)
+            if end < 0:
+                break
+            i = end + 2
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
 def scan_line(line_text: str, max_items: int = 4) -> List[Hint]:
     """对出错行做确定性检查，返回结构化提示。"""
     hints: List[Hint] = []
     if not line_text:
         return hints
 
-    # 注释里的全角字符不算问题，先剔除注释部分再判断
-    code_part = line_text.split("//")[0]
+    # 注释里的全角字符不算问题；字符串里的更是**故意写的**内容，也不算。
+    code_part = _code_part(line_text)
     # 全角空格虽然在 FULLWIDTH 里（自动修复需要它），但提示语交给下面
     # INVISIBLE 那条说——「看不见」才是它真正坑人的地方，措辞不一样。
     fw = [h for h in find_fullwidth(code_part) if h[1] not in INVISIBLE]

@@ -7,9 +7,7 @@
 - GCC 的语法错误没有错误码，只有警告带 -W 选项名，因此需要消息指纹兜底。
 """
 from dataclasses import dataclass, field
-from typing import List, Optional
-
-LEVELS = ("error", "fatal error", "warning", "note")
+from typing import List
 
 
 @dataclass
@@ -91,9 +89,4 @@ def dedupe(diags: List[Diagnostic]) -> List[Diagnostic]:
     return out
 
 
-def first_error(diags: List[Diagnostic]) -> Optional[Diagnostic]:
-    """只取第一条错误（遵循 Becker 的 Fix the First 原则）。"""
-    for d in sorted(diags, key=lambda x: x.sort_key()):
-        if d.is_error:
-            return d
-    return None
+

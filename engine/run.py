@@ -13,21 +13,24 @@
 
 这几条都不是"理论上可能"，是初学者程序每天都会出现的状态。
 """
+import hashlib
 import itertools
 import os
+import shutil
 import time
 from dataclasses import dataclass, field
 from typing import Any, List, Optional
 
 from . import compilers as compilers_mod
 from . import config as config_mod
+from .encoding import decode_output
 
 # Windows 的异常返回码：直接给学生看 3221225477 等于什么都没说
 _WIN_EXIT = {
-    0xC0000005: ("读写了不该访问的内存", "最常见的是**数组越界**或**用了空指针**。"
+    0xC0000005: ("读写了不该访问的内存", "最常见的是数组越界或用了空指针。"
                                       "检查下标有没有超出数组长度、指针有没有初始化。"),
     0xC0000094: ("整数除以 0", "检查除法/取余的除数，尤其是 `a % b` 里 b 会不会等于 0。"),
-    0xC00000FD: ("栈溢出", "多半是**递归没有终止条件**，或者局部数组开得太大。"),
+    0xC00000FD: ("栈溢出", "多半是递归没有终止条件，或者局部数组开得太大。"),
     0xC0000374: ("堆内存被破坏", "常见于越界写数组、释放后又使用（use after free）。"),
     0xC000013A: ("程序被中断", "运行期间被 Ctrl+C 或任务管理器结束了。"),
     0xC0000409: ("栈缓冲区被破坏", "常见于数组越界写、字符串拷贝超出长度。"),
@@ -68,7 +71,7 @@ class RunResult:
 
 
 def normalize_encoding(name: str) -> str:
-    """把 utf-8-sig 之类**只对文件有意义**的编码名归一化。
+    """把 utf-8-sig 之类只对文件有意义的编码名归一化。
 
     踩过的坑：源码是 UTF-8 带 BOM 时，用 "utf-8-sig" 去编码喂给程序的输入，
     会在 stdin 开头插入 EF BB BF 三个字节，`scanf("%d")` 直接解析失败，
@@ -83,30 +86,70 @@ def normalize_encoding(name: str) -> str:
     return n or "utf-8"
 
 
-def decode_output(raw: bytes, prefer: str = "utf-8") -> str:
-    """解码程序输出。
+def _locate_exe(res, workdir: str) -> str:
+    """找出编译产物。编译成功但找不到 exe 是真实会发生的（不同编译器命名习惯）。
 
-    顺序很讲究：**先严格试 UTF-8**，失败再按源码编码/GBK 兜底。
-
-    为什么不能"按源码编码优先"：GBK 的字节空间很宽，几乎任何字节序列都能解出**某个**
-    结果，所以"GBK 解成功了"根本不是证据。反过来 UTF-8 校验很严，
-    一个 GBK 编码的中文串几乎不可能碰巧是合法 UTF-8。所以 UTF-8 严格通过基本就是它。
-    （实测：按源码编码优先时，程序输出的中文会变成 תȦ 这样的乱码。）
+    以前面板运行和命令行运行各写了一份；现在只跑面板这一条路，仍保留成函数，
+    免得以后再有人复制一遍。
     """
-    if not raw:
+    exe = res.exe or ""
+    if exe and not os.path.isabs(exe):
+        exe = os.path.join(workdir, exe)
+    if not exe or not os.path.exists(exe):
+        for name in ("a.exe", "main.exe", "program.exe"):
+            cand = os.path.join(workdir, name)
+            if os.path.exists(cand):
+                return cand
+    return exe if exe and os.path.exists(exe) else ""
+
+
+def _cache_key(source: str, compiler, cfg: dict) -> str:
+    """按"源码内容 + 编译器 + 关键编译选项"算一个缓存键。
+
+    为什么要按内容而不是按文件名：学生改了代码就得重新编译，没改就完全不用——
+    每次按 F9 都重新 cl 一遍（实测 0.13 秒），再加上刚生成的 exe 第一次执行
+    还要被杀软扫一遍（0.06~0.3 秒），重复按 F9 就明显"卡一下"。
+    """
+    h = hashlib.sha1()
+    try:
+        with open(source, "rb") as f:
+            h.update(f.read())
+    except OSError:
         return ""
-    prefer = normalize_encoding(prefer)
-    order = ["utf-8"]
-    for enc in (prefer, "gbk", "cp936", "big5"):
-        if enc and enc.lower() not in [o.lower() for o in order]:
-            order.append(enc)
-    order.append("latin-1")
-    for enc in order:
-        try:
-            return raw.decode(enc)
-        except (UnicodeDecodeError, LookupError):
-            continue
-    return raw.decode("utf-8", errors="replace")
+    # 目录也要算进键里：两份内容完全相同、但放在不同文件夹的代码，可能各自
+    # include 同名的本地头文件，编出来的程序并不一样。
+    h.update(os.path.dirname(os.path.abspath(source)).encode("utf-8"))
+    c = cfg.get("compiler") or {}
+    h.update(("%s|%s|%s|%s" % (
+        getattr(compiler, "name", "?"),
+        getattr(compiler, "vcvars", "") or getattr(compiler, "gcc", ""),
+        c.get("std", "c17"), bool(c.get("warnings", True)))).encode("utf-8"))
+    return h.hexdigest()[:16]
+
+
+def _cache_exe(cache_dir: str, key: str, exe: str) -> str:
+    """把刚编译出来的 exe 存进缓存目录，返回缓存里的路径。"""
+    if not key or not exe:
+        return ""
+    d = os.path.join(cache_dir, key)
+    try:
+        os.makedirs(d, exist_ok=True)
+        dst = os.path.join(d, os.path.basename(exe))
+        shutil.copy2(exe, dst)
+        return dst
+    except OSError:
+        return ""
+
+
+def _prune_cache(cache_dir: str, keep: int = 24) -> None:
+    """缓存只留最近若干份，免得学生天天改代码把磁盘堆满。"""
+    try:
+        subs = [os.path.join(cache_dir, n) for n in os.listdir(cache_dir)]
+        subs = [p for p in subs if os.path.isdir(p)]
+        for p in sorted(subs, key=lambda x: os.path.getmtime(x))[:-keep]:
+            shutil.rmtree(p, ignore_errors=True)
+    except OSError:
+        pass
 
 
 def run_once(source: str, workdir: str, stdin_text: str = "",
@@ -114,8 +157,15 @@ def run_once(source: str, workdir: str, stdin_text: str = "",
              source_encoding: str = "utf-8",
              compiler: Optional[Any] = None,
              cfg: Optional[dict] = None,
-             max_output: int = DEFAULT_MAX_OUTPUT) -> RunResult:
-    """编译 source；只有编译通过才运行。"""
+             max_output: int = DEFAULT_MAX_OUTPUT,
+             on_output=None, stdin_queue=None) -> RunResult:
+    """编译 source；只有编译通过才运行。
+
+    on_output 不为 None 时把程序输出**实时**回调出去（面板用它边跑边显示），
+    stdin_queue 不为 None 时改成半交互：往队列里放字符串就是给程序送一行输入。
+
+    两者都不给时和以前完全一样：一次性喂 stdin、等程序结束再返回。
+    """
     cfg = cfg or config_mod.load()
     if compiler is None:
         compiler = compilers_mod.detect(None, cfg)
@@ -125,26 +175,33 @@ def run_once(source: str, workdir: str, stdin_text: str = "",
         return r
 
     os.makedirs(workdir, exist_ok=True)
-    res = compiler.compile(source, workdir)
-    result = RunResult(diagnostics=list(res.diagnostics or []), exe=res.exe or "")
 
-    if not res.ok:
-        result.compiled = False
-        result.notes.append("编译没有通过，所以没有运行。先按 F5 看报错讲解。")
-        return result
-    result.compiled = True
+    # ---- 源码没变就直接用上次编译出来的 exe ----
+    cache_dir = os.path.join(config_mod.path_of("build"), "run_cache")
+    key = _cache_key(source, compiler, cfg)
+    cached = os.path.join(cache_dir, key, os.path.basename(
+        os.path.splitext(source)[0] + ".exe")) if key else ""
+    if cached and os.path.exists(cached):
+        result = RunResult()
+        result.compiled = True
+        result.exe = cached
+    else:
+        res = compiler.compile(source, workdir)
+        result = RunResult(diagnostics=list(res.diagnostics or []), exe=res.exe or "")
+        if not res.ok:
+            result.compiled = False
+            result.notes.append("编译没有通过，所以没有运行。先按 F5 看报错讲解。")
+            return result
+        result.compiled = True
+        stored = _cache_exe(cache_dir, key, result.exe)
+        if stored:
+            result.exe = stored
+            _prune_cache(cache_dir)
 
-    exe = res.exe or ""
-    if exe and not os.path.isabs(exe):
-        exe = os.path.join(workdir, exe)
+    exe = result.exe
     if not exe or not os.path.exists(exe):
-        # 有些编译器把可执行文件放在工作目录下的固定名字
-        for name in ("a.exe", "main.exe", "program.exe"):
-            cand = os.path.join(workdir, name)
-            if os.path.exists(cand):
-                exe = cand
-                break
-    if not exe or not os.path.exists(exe):
+        exe = _locate_exe(result, workdir)
+    if not exe:
         result.notes.append("编译成功了，但找不到生成的可执行文件。")
         return result
     result.exe = exe
@@ -152,7 +209,10 @@ def run_once(source: str, workdir: str, stdin_text: str = "",
     t0 = time.time()
     code, out, err, timed_out, truncated = compilers_mod.run_safely(
         [exe], workdir, timeout=timeout, max_bytes=max_output,
-        stdin_text=stdin_text, stdin_encoding=normalize_encoding(source_encoding))
+        stdin_text=None if stdin_queue is not None else stdin_text,
+        stdin_encoding=normalize_encoding(source_encoding),
+        on_output=on_output, output_fallback=source_encoding,
+        stdin_queue=stdin_queue)
     result.duration = time.time() - t0
     result.exit_code = code
     result.timed_out = timed_out
@@ -162,9 +222,20 @@ def run_once(source: str, workdir: str, stdin_text: str = "",
     result.ok = (not timed_out) and code == 0
 
     if timed_out:
-        result.notes.append(
-            "程序运行超过 %d 秒还没结束，已强制终止 —— **多半是死循环**。"
-            "检查一下循环条件、循环变量有没有变化（比如忘了 i++）。" % timeout)
+        if stdin_queue is not None:
+            # 半交互模式下"卡住"最常见的原因不是死循环，而是程序停在 scanf 上
+            # 等人输入。这种情况说成"死循环"会把学生带偏，必须先讲输入。
+            result.notes.append(
+                "程序运行超过 %d 秒还没结束，已强制终止。"
+                "先看是不是停在 scanf / gets 上等你输入：在输入框里输入后回车"
+                "（程序问几行就答几行），输完了点「结束输入」等它跑完。"
+                "如果它根本不需要输入，那要么是死循环（检查循环条件和 i++），"
+                "要么是这段程序本来就慢（比如循环一亿次）——把工具栏上的"
+                "超时秒数调大再跑。" % timeout)
+        else:
+            result.notes.append(
+                "程序运行超过 %d 秒还没结束，已强制终止 —— 多半是死循环。"
+                "检查一下循环条件、循环变量有没有变化（比如忘了 i++）。" % timeout)
     if truncated:
         result.notes.append("输出太长，只保留了前面一部分。")
     if not result.ok and not timed_out:
@@ -181,7 +252,7 @@ _UNIQ_SEQ = itertools.count(1)
 
 
 def unique_workdir(base: str, keep: int = 6) -> str:
-    """为这一次运行准备一个**独立**的工作目录。
+    """为这一次运行准备一个独立的工作目录。
 
     为什么必须独立（这是实测踩出来的坑）：
     上一次运行的程序很可能还在跑 —— 控制台窗口开着、程序还在等 scanf 输入，
@@ -223,110 +294,6 @@ def unique_workdir(base: str, keep: int = 6) -> str:
     except OSError:
         pass
     return path
-
-
-def console_encoding(compiler_name: str) -> str:
-    """决定系统控制台该用哪个代码页。
-
-    实测差异：MSVC 不带 `/utf-8` 时，字符串字面量按**系统 ANSI 代码页**
-    （中文 Windows 上是 GBK）生成；而 MinGW GCC 默认按 **UTF-8**。
-    所以同一份 UTF-8 源码，在两家的控制台里表现不同，不能一刀切。
-
-    选错了的表现就是"程序输出中文全是乱码"——而这跟学生的代码毫无关系。
-    """
-    return "utf-8" if (compiler_name or "").lower() == "gcc" else "gbk"
-
-
-CONSOLE_BAT = """@echo off
-title ctutor - running your program
-{chcp}cd /d "%~dp0"
-echo.
-"{exe}"
-echo.
-echo [程序已结束] 按任意键关闭这个窗口...
-pause >nul
-"""
-
-
-def build_console_bat(exe: str, workdir: str, compiler_name: str = "msvc") -> str:
-    """生成一个用于在系统命令行里运行程序的 .bat，返回它的路径。
-
-    为什么用 .bat 而不是直接 Popen(["cmd","/c", "prog.exe & pause"])：
-    cmd 的引号转义规则极其容易出错（路径带空格、带中文时必翻车）。
-    写成文件就完全不用拼命令行，而且 `cd /d "%~dp0"` 让工作目录自动等于 exe 所在目录。
-
-    为什么必须有 pause：程序跑完窗口会立刻消失，学生根本来不及看输出——
-    这是初学者用 IDE 时最常见的困惑之一。
-    """
-    enc = console_encoding(compiler_name)
-    # chcp 放在**第一行**：cmd 是逐行读取并执行的，之后的正文按新代码页解释，
-    # 所以整份文件要按目标代码页写。中文提示因此不会变成乱码。
-    chcp = "chcp 65001 >nul\n" if enc == "utf-8" else ""
-    body = CONSOLE_BAT.format(chcp=chcp, exe=exe)
-    path = os.path.join(workdir, "_run_console.bat")
-    with open(path, "w", encoding="utf-8" if enc == "utf-8" else "gbk",
-              errors="replace", newline="\r\n") as f:
-        f.write(body)
-    return path
-
-
-def run_in_console(source: str, workdir: str, compiler: Optional[Any] = None,
-                   cfg: Optional[dict] = None) -> RunResult:
-    """在**系统命令行窗口**里运行程序。
-
-    与 run_once 的区别：不捕获输出，而是开一个真正的控制台。
-    这样 `scanf` 是真正交互式的——学生能看到提示语、能现场输入，
-    和他们在书上/课上学到的行为完全一致。
-
-    仍然先编译：编译不过就不开窗口（否则窗口一闪而过，什么也看不到）。
-    """
-    import subprocess
-
-    cfg = cfg or config_mod.load()
-    if compiler is None:
-        compiler = compilers_mod.detect(None, cfg)
-    if compiler is None:
-        r = RunResult()
-        r.notes.append("没有找到可用的编译器（MSVC 或 GCC）。")
-        return r
-
-    os.makedirs(workdir, exist_ok=True)
-    res = compiler.compile(source, workdir)
-    result = RunResult(diagnostics=list(res.diagnostics or []), exe=res.exe or "")
-    if not res.ok:
-        result.compiled = False
-        result.notes.append("编译没有通过，所以没有运行。先按 F5 看报错讲解。")
-        return result
-    result.compiled = True
-
-    exe = res.exe or ""
-    if exe and not os.path.isabs(exe):
-        exe = os.path.join(workdir, exe)
-    if not exe or not os.path.exists(exe):
-        for name in ("a.exe", "main.exe", "program.exe"):
-            cand = os.path.join(workdir, name)
-            if os.path.exists(cand):
-                exe = cand
-                break
-    if not exe or not os.path.exists(exe):
-        result.notes.append("编译成功了，但找不到生成的可执行文件。")
-        return result
-    result.exe = exe
-
-    bat = build_console_bat(exe, workdir, compiler.name)
-    try:
-        # CREATE_NEW_CONSOLE：给程序一个属于自己的控制台窗口。
-        # 不加这个的话，从图形程序里启动的控制台子进程没有终端可交互，scanf 会立刻失败。
-        subprocess.Popen(["cmd.exe", "/c", bat], cwd=workdir,
-                         creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0),
-                         close_fds=True)
-    except OSError as e:
-        result.notes.append("无法打开系统命令行窗口：%s" % e)
-        return result
-
-    result.ok = True
-    result.notes.append("已在系统命令行窗口里运行（可以交互输入）。")
-    return result
 
 
 def format_result(r: RunResult) -> str:

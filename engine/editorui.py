@@ -707,9 +707,12 @@ window.__ctutor_mark_state = {stage: 'start'};
     }).observe(document.body, { childList: true, subtree: true, characterData: true });
   } catch (e) { /* 忽略：轮询还能兜底 */ }
 
-  // 右键/菜单键按下的瞬间连翻几次，尽量让人眼看不到那一帧英文
+  // 右键/菜单键按下的瞬间连翻几次，尽量让人眼看不到那一帧英文。
+  // 先判断"有没有菜单"再翻：这段挂在**每个** mousedown / keydown 上，
+  // 不判断的话，正常打字每敲一个键都要把整个 DOM 扫 4 遍（菜单根本不存在）。
   ['contextmenu', 'mousedown', 'mouseup', 'keydown'].forEach(function (evt) {
     document.addEventListener(evt, function () {
+      if (!hasMenu()) return;
       setTimeout(flush, 0);
       setTimeout(flush, 40);
       setTimeout(flush, 120);

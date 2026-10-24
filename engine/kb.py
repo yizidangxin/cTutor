@@ -39,10 +39,23 @@ class KnowledgeBase:
     def __init__(self, entries: Optional[List[Dict[str, Any]]] = None):
         self.entries: List[Dict[str, Any]] = entries or []
         self._by_code: Dict[str, List[Dict[str, Any]]] = {}
+        # 消息指纹预先摊平：lookup() 每次检查都要按指纹扫一遍全库，
+        # covers() 更是要把每条指纹归一化后再比。这些数据装载后就不会变，
+        # 因此只在构造时算一次——以前每次查询都重新 .get() 加重新跑正则。
+        self._patterns: List[tuple] = []            # (原文, 条目, 该条目是否带错误码)
+        self._norm_patterns: List[str] = []         # 归一化后的指纹（covers 用）
         for e in self.entries:
             for code in [e.get("code")] + list(e.get("aliases") or []):
                 if code:
                     self._by_code.setdefault(code.upper(), []).append(e)
+            has_code = bool(e.get("code"))
+            for p in e.get("match_message") or []:
+                if not p:
+                    continue
+                self._patterns.append((p, e, has_code))
+                np = _normalize(p)
+                if np:
+                    self._norm_patterns.append(np)
 
     # ---------- 装载 ----------
     @classmethod
@@ -81,12 +94,11 @@ class KnowledgeBase:
             if candidates:
                 return candidates[0]                      # 都不匹配则退回首条
         # 2) 消息指纹匹配（GCC 语法错误无错误码；或错误码未收录）
-        for e in self.entries:
-            if e.get("code") and diag.code:
+        for p, e, has_code in self._patterns:
+            if has_code and diag.code:
                 continue          # 已有错误码时不跨码匹配，避免张冠李戴
-            for p in e.get("match_message") or []:
-                if p and p in diag.message:
-                    return e
+            if p in diag.message:
+                return e
         return None
 
     def stats(self) -> Dict[str, int]:
@@ -109,9 +121,7 @@ class KnowledgeBase:
         if token.upper() in self._by_code:
             return True
         norm = _normalize(token)
-        for e in self.entries:
-            for p in e.get("match_message") or []:
-                np = _normalize(p)
-                if np and (np in norm or norm in np):
-                    return True
+        for np in self._norm_patterns:
+            if np in norm or norm in np:
+                return True
         return False

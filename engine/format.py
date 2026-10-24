@@ -18,7 +18,7 @@
 和 autofix 一样，用一个跨行的小状态机判断"这一行到底处于什么上下文"，
 所以 printf("{") 里的花括号不会被当成块的开头。
 """
-from typing import List, NamedTuple, Optional, Tuple
+from typing import List, NamedTuple, Tuple
 
 INDENT_WIDTH = 4
 
@@ -199,31 +199,3 @@ def format_c_source(text: str, indent_width: int = INDENT_WIDTH) -> Tuple[str, i
         return text, 0
 
     return new_text, changed
-
-
-def format_c_file(src: str, dst: Optional[str] = None, inplace: bool = False,
-                  encoding: Optional[str] = None,
-                  indent_width: int = INDENT_WIDTH):
-    """格式化文件。默认写副本，不改原文件。
-
-    返回 (是否修改, 输出路径, 改动行数)。
-    """
-    from .encoding import detect_source_encoding
-
-    enc = encoding or detect_source_encoding(src)
-    with open(src, "rb") as f:
-        raw = f.read()
-    try:
-        text = raw.decode(enc)
-    except (UnicodeDecodeError, LookupError):
-        enc = "utf-8"
-        text = raw.decode("utf-8", errors="replace")
-
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
-    new_text, changed = format_c_source(text, indent_width=indent_width)
-
-    out = src if inplace else (dst or src + ".aligned.c")
-    if changed:
-        with open(out, "wb") as f:
-            f.write(new_text.encode(enc, errors="replace"))
-    return bool(changed), out, changed

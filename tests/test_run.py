@@ -7,7 +7,9 @@
 这些情况如果处理错了，表现往往是"结果莫名其妙"而不是报错，必须用测试钉住。
 """
 import os
+import queue
 import sys
+import threading
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -97,34 +99,6 @@ if _comp_uniq is not None:
 _open_holder.close()
 
 print()
-print("— 系统命令行方式 —")
-check("GCC 用 UTF-8 控制台（MinGW 的执行字符集是 UTF-8）",
-      run_mod.console_encoding("gcc") == "utf-8")
-check("MSVC 用 GBK 控制台（不带 /utf-8 时按系统 ANSI 代码页生成字面量）",
-      run_mod.console_encoding("msvc") == "gbk")
-
-_bat_dir = os.path.join(WORK, "console_bat")
-os.makedirs(_bat_dir, exist_ok=True)
-_bat = run_mod.build_console_bat(os.path.join(_bat_dir, "a.exe"), _bat_dir, "gcc")
-check("生成了控制台启动脚本", os.path.exists(_bat), _bat)
-_bat_txt = open(_bat, encoding="utf-8").read()
-check("脚本里设了 chcp 65001（否则 UTF-8 中文输出全乱码）", "chcp 65001" in _bat_txt)
-check("脚本用 %~dp0 定位工作目录（不拼路径，避免引号/中文翻车）",
-      'cd /d "%~dp0"' in _bat_txt)
-check("脚本结尾有 pause（否则窗口一闪而过，学生看不到输出）",
-      "pause" in _bat_txt)
-# MSVC 的脚本要按 GBK 写，不能是 UTF-8
-_bat2 = run_mod.build_console_bat(os.path.join(_bat_dir, "b.exe"), _bat_dir, "msvc")
-try:
-    open(_bat2, encoding="utf-8").read()
-    _utf8_ok = True
-except UnicodeDecodeError:
-    _utf8_ok = False
-check("MSVC 的脚本按 GBK 编码写（在 936 控制台里中文才不会乱）",
-      ("chcp" not in open(_bat2, encoding="gbk").read()) and (not _utf8_ok),
-      "utf8_readable=%s" % _utf8_ok)
-
-print()
 print("— 真编译真运行 —")
 comp = compilers.detect(None, config_mod.load())
 if comp is None:
@@ -207,6 +181,138 @@ int main(void) { int a; scanf("%d", &a); return 0; }
     check("需要输入却没给：不挂死，且提示去填输入",
           (not res_need.timed_out) and any("输入" in n for n in res_need.notes),
           res_need.notes)
+
+# ---------------------------------------------------------------- 流式输出与编译缓存
+print()
+print("— 流式输出与编译缓存 —")
+if comp is None:
+    print("[SKIP] 本机没有可用编译器")
+else:
+    import time as _time
+
+    src_slow = write_case("slow.c", """#include <stdio.h>
+#include <windows.h>
+int main(void) {
+    for (int i = 1; i <= 3; i++) { printf("L%d\\n", i); fflush(stdout); Sleep(350); }
+    fprintf(stderr, "E1\\n");
+    return 0;
+}
+""")
+    stamps = []
+    t_start = _time.perf_counter()
+    res_slow = run_mod.run_once(src_slow, os.path.join(WORK, "t_stream"), timeout=30,
+                                source_encoding="utf-8", compiler=comp,
+                                on_output=lambda t: stamps.append(
+                                    (_time.perf_counter() - t_start, t)))
+    total = _time.perf_counter() - t_start
+    joined = "".join(t for _, t in stamps)
+    check("流式输出：程序还在跑就已经拿到分批输出", len(stamps) >= 2, len(stamps))
+    check("流式输出：第一块明显早于程序结束（不是攒完才给）",
+          bool(stamps) and stamps[0][0] < total - 0.3,
+          (round(stamps[0][0], 2), round(total, 2)) if stamps else None)
+    check("流式输出：分批发的内容拼起来就是完整输出",
+          "L1" in joined and "L3" in joined and "L3" in res_slow.stdout,
+          joined[:60])
+    check("流式输出：stderr 也并进同一股，顺序不乱", "E1" in joined, joined[:60])
+
+    src_loop2 = write_case("loop2.c", """#include <stdio.h>
+#include <windows.h>
+int main(void) { int i = 0; for (;;) { printf("tick %d\\n", i++); fflush(stdout); Sleep(100); } }
+""")
+    got = []
+    res_to = run_mod.run_once(src_loop2, os.path.join(WORK, "t_stream2"), timeout=2,
+                              source_encoding="utf-8", compiler=comp,
+                              on_output=got.append)
+    check("死循环超时：已经打印出来的内容仍然保留",
+          res_to.timed_out and len(got) >= 3 and "tick" in res_to.stdout,
+          (res_to.timed_out, len(got)))
+
+    # 缓存：同样的源码第二次不该再编译
+    src_q = write_case("cache.c",
+                       '#include <stdio.h>\nint main(void){printf("c1\\n");return 0;}\n')
+    wd_c = os.path.join(WORK, "t_cache")
+    t0 = _time.perf_counter()
+    r1 = run_mod.run_once(src_q, wd_c, timeout=10, compiler=comp)
+    dt1 = _time.perf_counter() - t0
+    t0 = _time.perf_counter()
+    r2 = run_mod.run_once(src_q, wd_c, timeout=10, compiler=comp)
+    dt2 = _time.perf_counter() - t0
+    # 注意：缓存是跨进程留着的，跑第二遍测试时第一次也可能已经命中，
+    # 所以这里判"第二次够快"（编译一次 100ms 起步），而不是"比第一次快多少"。
+    check("同内容重复运行：第二次不用再编译（够快且输出对）",
+          dt2 < 0.25 and r2.stdout.strip() == "c1",
+          (round(dt1 * 1000), round(dt2 * 1000)))
+    check("同内容重复运行：输出与第一次一致", r1.stdout.strip() == r2.stdout.strip() == "c1",
+          (r1.stdout, r2.stdout))
+    with open(src_q, "w", encoding="utf-8", newline="\n") as f:
+        f.write('#include <stdio.h>\nint main(void){printf("c2\\n");return 0;}\n')
+    r3 = run_mod.run_once(src_q, wd_c, timeout=10, compiler=comp)
+    check("改了代码必须重新编译：输出跟着变", r3.stdout.strip() == "c2", r3.stdout)
+
+# ---------------------------------------------------------------- 半交互输入
+print()
+print("— 半交互输入（程序问一句、这边答一句）—")
+if comp is None:
+    print("[SKIP] 本机没有可用编译器")
+else:
+    src_ask = write_case("ask.c", """#include <stdio.h>
+int main(void) {
+    int a = 0, b = 0;
+    printf("A?\\n"); fflush(stdout);
+    if (scanf("%d", &a) != 1) { printf("读不到第一个数\\n"); return 3; }
+    printf("B?\\n"); fflush(stdout);
+    if (scanf("%d", &b) != 1) { printf("读不到第二个数\\n"); return 4; }
+    printf("sum=%d\\n", a + b);
+    return 0;
+}
+""")
+    q = queue.Queue()
+    seen = []
+
+    def auto_answer(text):
+        seen.append(text)
+        if "A?" in text:
+            q.put("3\n")
+        if "B?" in text:
+            q.put("4\n")
+
+    res_ask = run_mod.run_once(src_ask, os.path.join(WORK, "t_ask"), timeout=20,
+                               source_encoding="utf-8", compiler=comp,
+                               on_output=auto_answer, stdin_queue=q)
+    check("半交互：程序问一句、这边答一句，结果正确",
+          "sum=7" in res_ask.stdout, res_ask.stdout)
+    check("半交互：确实是分两次问、分两次答（不是一次塞完）",
+          len(seen) >= 2 and "A?" in seen[0], [t.strip() for t in seen])
+    check("半交互：程序读不到数据会提前退出（不会挂到超时）",
+          (not res_ask.timed_out) and res_ask.exit_code == 0,
+          (res_ask.timed_out, res_ask.exit_code))
+
+    # 送 EOF（None）后，等输入的程序应当立刻结束，而不是等到超时
+    src_need2 = write_case("need2.c",
+                           "#include <stdio.h>\nint main(void){int a;"
+                           "if(scanf(\"%d\", &a)!=1) return 7; return 0;}\n")
+    # 这个程序一行输出都没有（直接等输入），所以不能靠"看到输出就送"，
+    # 而是在另一个线程里等它真的开始等了，再送 EOF。
+    q2 = queue.Queue()
+    threading.Timer(0.5, lambda: q2.put(None)).start()
+    res_eof = run_mod.run_once(src_need2, os.path.join(WORK, "t_eof"), timeout=20,
+                               source_encoding="utf-8", compiler=comp,
+                               stdin_queue=q2)
+    src_wait = write_case("wait.c", """#include <stdio.h>
+int main(void) { int n = 0; printf("输入位数\\n"); fflush(stdout);
+                  scanf("%d", &n); printf("%d\\n", n); return 0; }
+""")
+    q3 = queue.Queue()
+    res_wait = run_mod.run_once(src_wait, os.path.join(WORK, "t_wait"), timeout=3,
+                                source_encoding="utf-8", compiler=comp,
+                                on_output=lambda t: None, stdin_queue=q3)
+    check("半交互超时：提示先问是不是在等输入，而不是武断说死循环",
+          res_wait.timed_out and any("输入" in n for n in res_wait.notes),
+          res_wait.notes)
+
+    check("半交互：送 EOF 后等输入的程序立刻结束",
+          (not res_eof.timed_out) and res_eof.exit_code == 7,
+          (res_eof.timed_out, res_eof.exit_code))
 
 n_fail = sum(1 for _, ok in results if not ok)
 print()

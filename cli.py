@@ -21,7 +21,7 @@ from engine.encoding import detect_source_encoding         # noqa: E402
 from engine.kb import KnowledgeBase                         # noqa: E402
 
 ROOT = config_mod.ROOT
-TOOL_VERSION = "0.5.0"
+TOOL_VERSION = "0.6.0"
 REPORT_SCHEMA = "ctutor/report/1"
 
 
@@ -107,7 +107,7 @@ def cmd_doctor(args) -> int:
 
 # ---------------------------------------------------------------- set-key
 def cmd_set_key(args) -> int:
-    """把密钥写进**用户目录**配置（不是项目目录），这样打包分享项目不会带出密钥。"""
+    """把密钥写进用户目录配置（不是项目目录），这样打包分享项目不会带出密钥。"""
     import getpass
     cur = ai_mod.find_api_key()
     if cur:
@@ -421,7 +421,7 @@ def _try_deterministic_fix(source: str, comp, wd: str, max_iter: int = 3):
 
 def cmd_fix(args) -> int:
     cfg = config_mod.load()
-    print("注意：本命令**超出工具定位**（本工具只负责帮你看懂报错，不负责替你改代码）。")
+    print("注意：本命令超出工具定位（本工具只负责帮你看懂报错，不负责替你改代码）。")
     print("      它是实验性的确定性修复，且必须通过编译验证才会写回。")
     print()
     source = os.path.abspath(args.file)

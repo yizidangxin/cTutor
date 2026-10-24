@@ -15,8 +15,10 @@ import argparse
 import html
 import json
 import os
+import queue
 import sys
 import tempfile
+import threading
 import time
 import traceback
 
@@ -33,7 +35,8 @@ for _stream in (sys.stdout, sys.stderr):
 
 from PySide6.QtCore import (Qt, QEvent, QEasingCurve, QObject,        # noqa: E402
                             QPropertyAnimation, QThread, QTimer, Signal)
-from PySide6.QtGui import QAction, QFont, QFontDatabase, QKeySequence  # noqa: E402
+from PySide6.QtGui import (QAction, QFont, QFontDatabase, QKeySequence,  # noqa: E402
+                           QTextCursor)
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox,   # noqa: E402
                                QDialog, QDialogButtonBox, QFileDialog, QHBoxLayout,
                                QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem,
@@ -54,6 +57,8 @@ import newproject as newproject_mod                                 # noqa: E402
 from engine.encoding import detect_source_encoding, encoding_label, read_source  # noqa: E402
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
+# 右键菜单现场快照默认关闭：只是排查用的，不该在每次启动时花 240 次页面 JS。
+_MENU_DEBUG = os.environ.get("CTUTOR_MENU_DEBUG", "") in ("1", "true", "on")
 ENCODINGS = [("GBK（中文 Windows 默认，Dev-C++ 同款）", "mbcs"),
              ("UTF-8", "utf-8"),
              ("UTF-8 带 BOM（VS 推荐）", "utf-8-sig")]
@@ -389,46 +394,64 @@ class CheckWorker(QThread):
 
 
 class RunWorker(QThread):
-    """在后台编译并运行程序。
+    """在后台编译并运行程序，输出捕获回面板。
 
-    两种模式：
-      · "console" —— 开一个真正的系统命令行窗口，scanf 可以交互输入（默认）；
-      · "panel"   —— 捕获输出显示在面板里（适合不需要交互、想直接看结果的场合）。
+    必须放后台：程序可能有死循环（就算有超时，卡在主线程里界面也会冻住）；
+    而且要运行就得先编译，编译本身也要几百毫秒到几秒。
 
-    必须放后台：面板模式可能有死循环（就算有超时，卡在主线程里界面也会冻住）；
-    两种模式都要先编译，编译本身也要几百毫秒到几秒。
+    不再打开系统命令行窗口：以前 F9 会弹一个黑框，学生机器上容易误以为"卡住/
+    中毒"，而且黑框和面板两处输出容易对不上。现在统一显示在「运行输出」页。
     """
 
     done = Signal(object)
     failed = Signal(str)
+    chunk = Signal(str)          # 程序跑到一半就有输出了：边跑边发，界面实时显示
 
     def __init__(self, working_path, stdin_text, source_encoding, prefer,
-                 timeout=10, mode="console", parent=None):
+                 timeout=10, parent=None):
         super().__init__(parent)
         self.working_path = working_path
-        self.stdin_text = stdin_text
+        self.initial_input = stdin_text or ""
         self.source_encoding = source_encoding
         self.prefer = prefer
         self.timeout = timeout
-        self.mode = mode
+        # 半交互的输：界面线程往里放一行，后台线程写进程序的 stdin
+        self._stdin = queue.Queue()
+        self._eof_sent = False          # EOF 只能送一次，重复送会提前关掉管道
+        self._eof_lock = threading.Lock()
+
+    def send(self, text: str):
+        """界面线程调用：给正在运行的程序送一行输入。"""
+        if not text.endswith("\n"):
+            text += "\n"
+        self._stdin.put(text)
+
+    def end_input(self) -> bool:
+        """界面线程调用：没有更多输入了（EOF）。重复点只算一次。"""
+        with self._eof_lock:
+            if self._eof_sent:
+                return False
+            self._eof_sent = True
+        self._stdin.put(None)
+        return True
 
     def run(self):
         try:
             from engine import run as run_mod
 
-            # 每次运行用独立目录：上一次的控制台窗口可能还开着、锁着 a.exe，
+            # 每次运行用独立目录：上一次运行可能还锁着 a.exe，
             # 共用目录会让下一次编译直接失败，报成"编译没有通过"，极难排查。
             wd = run_mod.unique_workdir(
                 os.path.join(config_mod.path_of("build"), "panel_run"))
             comp = compilers_mod.detect(self.prefer, config_mod.load())
-            if self.mode == "console":
-                res = run_mod.run_in_console(self.working_path, wd, compiler=comp)
-            else:
-                res = run_mod.run_once(self.working_path, wd,
-                                       stdin_text=self.stdin_text,
-                                       timeout=self.timeout,
-                                       source_encoding=self.source_encoding,
-                                       compiler=comp)
+            if self.initial_input.strip():
+                self.send(self.initial_input)      # 运行前就填好的，先一次性给它
+            res = run_mod.run_once(self.working_path, wd,
+                                   timeout=self.timeout,
+                                   source_encoding=self.source_encoding,
+                                   compiler=comp,
+                                   on_output=self.chunk.emit,
+                                   stdin_queue=self._stdin)
             self.done.emit(res)
         except Exception:                                           # noqa: BLE001
             self.failed.emit(traceback.format_exc())
@@ -463,6 +486,41 @@ def _norm_text(s: str) -> str:
     return s.replace("\r\n", "\n").replace("\r", "\n")
 
 
+# ---------------------------------------------------------------- 编译器预热
+_WARM = {"started": False}
+
+
+def _start_compiler_warmup() -> None:
+    """在后台把编译器环境初始化好（只做一次）。
+
+    为了什么：MSVC 每次编译前都要先跑 vcvars64.bat 初始化环境，实测约 1.8 秒，
+    而 cl 真正编译一个小文件只要约 0.1 秒——也就是说「按 F5 等两秒」里，
+    九成以上时间花在重复初始化上。引擎侧已经把这份环境缓存起来（只捕获一次），
+    这里再把那一次捕获挪到程序启动的后台，学生第一次检查也是秒出。
+
+    用 daemon 线程而不是 QThread：进程退出时它随解释器一起结束，
+    不会出现"界面已关闭但线程还在跑"的 Qt 崩溃/卡死。
+    """
+    if _WARM["started"]:
+        return
+    _WARM["started"] = True
+
+    def work():
+        try:
+            cfg = config_mod.load()
+            comp = compilers_mod.detect(None, cfg)
+            if isinstance(comp, compilers_mod.MsvcCompiler):
+                compilers_mod.MsvcCompiler._fast_path(
+                    comp.vcvars, config_mod.path_of("build", cfg))
+        except Exception:                                       # noqa: BLE001
+            pass
+
+    try:
+        threading.Thread(target=work, name="ctutor-warmup", daemon=True).start()
+    except Exception:                                           # noqa: BLE001
+        pass
+
+
 class Doc:
     """一个打开的文件。
 
@@ -475,7 +533,8 @@ class Doc:
     """
 
     __slots__ = ("path", "encoding", "text", "saved_text", "label", "modified",
-                 "marks", "format_undo", "compare_old", "compare_new", "anchors")
+                 "marks", "format_undo", "compare_old", "compare_new", "anchors",
+                 "input_text")
 
     def __init__(self, path=None, encoding="mbcs", text="", label="未命名"):
         self.path = path
@@ -491,6 +550,9 @@ class Doc:
         # 锚点：{"name": str, "line": int, "text": str}
         # 只是显示用的书签，**不写进 .c 文件**，也不算"文件被改动"
         self.anchors = []
+        # 这个文档自己的"程序输入"。不共享是有原因的：上个项目填的测试数据
+        # 留在输入框里，切到另一个项目按 F9 就把它喂给了别的程序。
+        self.input_text = ""
 
     def title(self) -> str:
         base = os.path.basename(self.path) if self.path else self.label
@@ -950,6 +1012,9 @@ class MainWindow(QMainWindow):
                 QTimer.singleShot(900, self._show_help_first_time)
         except Exception:                                       # noqa: BLE001
             pass
+        # 后台预热编译器环境：把 MSVC 那 1.8 秒的 vcvars 初始化挪到启动时，
+        # 学生第一次按 F5 就不必等它（之后每次检查本来只要几十毫秒）。
+        _start_compiler_warmup()
 
     # ---------- 当前文档（保留 self.path / self.encoding 的旧写法） ----------
     def _doc(self):
@@ -1027,6 +1092,11 @@ class MainWindow(QMainWindow):
             return
         d.text = txt
         d.modified = (txt != d.saved_text)
+        # 顺带把"程序输入"存回这个文档，切走/关闭后再回来还在
+        try:
+            d.input_text = self.txt_input.toPlainText()
+        except Exception:                                       # noqa: BLE001
+            pass
 
     def _poll_dirty(self):
         """定时检查有没有改动，给标签加 * 号。
@@ -1065,6 +1135,8 @@ class MainWindow(QMainWindow):
                 self.editor.mark_errors(d.marks)
             # 锚点跟着标签走：切过来就把这个文档的锚点画上（只画，不动文字）
             self.editor.set_anchors(list(d.anchors))
+            # 程序输入框也跟着文档走：每个项目各记各的，切过来只看到自己的数据
+            self.txt_input.setPlainText(d.input_text or "")
             # 没改动过的文档：把基线校正成编辑器实际返回的文本。
             # 编辑器可能对内容做归一化（比如换行符），不校正的话一打开就是"已修改"。
             if not d.modified:
@@ -1130,10 +1202,13 @@ class MainWindow(QMainWindow):
             self.cur = -1
             self._load_sample()          # 全关了就给一个示例，不留空白界面
             return
-        if index < self.cur or self.cur >= len(self.docs):
-            self.cur = max(0, min(self.cur, len(self.docs) - 1))
-        if index <= self.cur:
-            self.cur = min(self.cur, len(self.docs) - 1)
+        # 关掉的是当前标签左侧的标签时，当前文档的位置要**左移一位**。
+        # 以前这里只做 min(cur, len-1) 的钳制，没有减一：开着 A、B、C 而当前在 B，
+        # 关掉 A 之后界面会直接跳到 C —— 学生以为自己误删了东西。
+        if index < self.cur:
+            self.cur -= 1
+        elif self.cur >= len(self.docs):
+            self.cur = len(self.docs) - 1
         self._push_current_to_editor(self.docs[self.cur])
         self._sync_tabs()
         self._save_session()
@@ -1279,11 +1354,11 @@ class MainWindow(QMainWindow):
         self.btn_align = QPushButton("对齐")
         self.btn_align.setToolTip(
             "把缩进整理规范（Ctrl+Shift+F）。\n"
-            "只改行首缩进和行尾空格，**不会动你的代码内容**；\n"
+            "只改行首缩进和行尾空格，不会动你的代码内容；\n"
             "按 Ctrl+Shift+Z 可以撤回到对齐前。")
         self.btn_ai_fix = QPushButton("AI 修改")
         self.btn_ai_fix.setToolTip(
-            "让 AI 给一份**能编译通过**的修正代码（Ctrl+Shift+A）。\n"
+            "让 AI 给一份能编译通过的修正代码（Ctrl+Shift+A）。\n"
             "会先问你用哪种方式对照：原文里改 / 另开窗口 / 只在行下加注释。\n"
             "改动只进编辑器，不会自动保存到你的文件。")
         self.btn_compare = QPushButton("对照")
@@ -1295,14 +1370,14 @@ class MainWindow(QMainWindow):
         self.btn_anchor.setToolTip(
             "列出所有锚点，双击跳转。\n"
             "添加：在代码行上右键 → 添加锚点…（也可以删除本行锚点）\n"
-            "锚点只是书签，**不会改动你的代码**，也不会让文件变成「已修改」。")
+            "锚点只是书签，不会改动你的代码，也不会让文件变成「已修改」。")
         self.btn_anchor.clicked.connect(self.show_anchors)
         self.btn_check = QPushButton("检查 (F5)")
         self.btn_check.setDefault(True)
         self.btn_run = QPushButton("运行 (F9)")
         self.btn_run.setToolTip(
-            "在**系统命令行窗口**里运行，scanf 可以真正交互输入。\n"
-            "想直接在面板里看输出（不弹窗），用 Shift+F9。")
+            "编译并运行，输出直接显示在下面的「运行输出」页，不会弹黑色命令行窗口。\n"
+            "程序要输入（scanf）时，先把文字填进上方输入框再运行。")
         self.spin_timeout = QSpinBox()
         self.spin_timeout.setRange(1, 60)
         self.spin_timeout.setValue(10)
@@ -1383,6 +1458,21 @@ class MainWindow(QMainWindow):
         layout.addLayout(tabrow)
 
         splitter = QSplitter(Qt.Vertical)
+        # 分割条的"抓握区"要够大：默认只有 4px 的细线，鼠标不精确停到那条线上根本
+        # 拖不动——尤其下方面板是「运行输出」时，那条线紧贴输入框的上边框，
+        # 学生来回来找"交界点"。这里把整条加宽到 26px（约一个半鼠标箭头的高度），
+        # 下面那段正好盖住页签上方的浅灰留白，看上去就是一条浅灰分隔带，
+        # 悬停/按下再加深，位置一眼可见、一按就中。
+        splitter.setHandleWidth(30)
+        splitter.setStyleSheet("""
+            QSplitter::handle:vertical {
+                background: #f2f4f7;
+                border-top: 2px solid #b9c4d1;
+            }
+            QSplitter::handle:vertical:hover  { background: #e3eaf2; }
+            QSplitter::handle:vertical:pressed{ background: #d2dfee; }
+        """)
+        self.splitter = splitter
         splitter.addWidget(self.editor.widget)
 
         # 下方面板分两个页签：讲解 / 运行输出。
@@ -1401,19 +1491,46 @@ class MainWindow(QMainWindow):
         inrow.addWidget(QLabel("程序输入："))
         self.txt_input = QPlainTextEdit()
         self.txt_input.setPlaceholderText(
-            "程序用到 scanf / gets 时，把要输入的内容填在这里（每行一个，按运行时的顺序）")
+            "程序用到 scanf / gets 时：先填好再按 F9（一次性喂给它）；"
+            "运行中也在这里输入，回车发送——程序问一句、你答一句")
         self.txt_input.setFixedHeight(44)
         self.txt_input.setFont(QFont("Consolas", 10))
         inrow.addWidget(self.txt_input, 1)
+        self.btn_send_input = QPushButton("发送 (Enter)")
+        self.btn_send_input.setToolTip(
+            "程序运行中：把输入框里的这一行送进程序（回车也行）。\n"
+            "程序没在运行时这个按钮不亮——先按 F9。")
+        self.btn_send_input.setEnabled(False)
+        self.btn_send_input.clicked.connect(self._send_input)
+        inrow.addWidget(self.btn_send_input)
         rl.addLayout(inrow)
         self.view_run = QTextBrowser()
         self.view_run.setOpenExternalLinks(True)
+        # 运行输出按等宽字体显示：程序输出里的列对齐、缩进才有意义；
+        # 实时追加用的是纯文本，字体得在控件上设定。
+        self.view_run.setFont(QFont("Consolas", 10))
         self.view_run.setStyleSheet(
             "QTextBrowser{background:#FFFFFF;border:1px solid #dde3ea;}")
         rl.addWidget(self.view_run, 1)
         self.tabs.addTab(run_page, "运行输出")
+        # 「结束输入」放在页签栏右角，紧挨着「运行输出」：程序卡在"等输入到 EOF"
+        # 的时候（while (scanf(...) != EOF) 这类），学生盯着输出页就能顺手点它，
+        # 不用先回输入框。输入框空着按回车等同于点它。
+        self.btn_end_input = QPushButton("结束输入 (EOF)")
+        self.btn_end_input.setToolTip(
+            "告诉正在运行的程序：没有更多输入了（等价于终端里按 Ctrl+Z / Ctrl+D）。\n"
+            "程序读到 EOF 就会继续往下走或退出。\n"
+            "输入框空着按回车，效果相同。")
+        self.btn_end_input.setEnabled(False)
+        self.btn_end_input.clicked.connect(self._end_input)
+        self.tabs.setCornerWidget(self.btn_end_input, Qt.TopRightCorner)
         # 讲解栏和运行输出都装上平滑滚动（滚轮变成短动画，读长内容不跳）
         self._scrollers = [SmoothScroller(self.view), SmoothScroller(self.view_run)]
+        self._run_watch = QTimer(self)
+        self._run_watch.setInterval(500)
+        self._run_watch.timeout.connect(self._tick_run_watch)
+        self._last_chunk_at = 0.0
+        self._idle_hint_shown = True
         self._last_html = None
         # 缩放的事件过滤器挂在 QApplication 上（见 __init__），
         # 这样无论焦点在编辑器还是输出区都能生效。
@@ -1467,12 +1584,9 @@ class MainWindow(QMainWindow):
         act_check = QAction("检查", self)
         act_check.setShortcut("F5")
         act_check.triggered.connect(self.do_check)
-        act_run = QAction("在系统命令行中运行", self)
+        act_run = QAction("运行（输出显示在下方，不弹黑框）", self)
         act_run.setShortcut("F9")
         act_run.triggered.connect(self.do_run)
-        act_run_panel = QAction("在面板内运行（输出显示在下方）", self)
-        act_run_panel.setShortcut("Shift+F9")
-        act_run_panel.triggered.connect(self.do_run_panel)
         self.btn_run.clicked.connect(self.do_run)
         self.btn_new.clicked.connect(self.new_project)
         self.btn_save.clicked.connect(self.save_file)
@@ -1527,7 +1641,6 @@ class MainWindow(QMainWindow):
         m2 = self.menuBar().addMenu("运行")
         m2.addAction(act_check)
         m2.addAction(act_run)
-        m2.addAction(act_run_panel)
 
         m_view = self.menuBar().addMenu("视图")
         m_view.addAction(act_zoom_in)
@@ -1595,9 +1708,10 @@ class MainWindow(QMainWindow):
             '<p><b>缩进乱了？</b>点工具栏 <b>「对齐」</b>（<b>Ctrl+Shift+F</b>）会把缩进整理规范。'
             '它<b>只改行首缩进和行尾空格，不动你的代码内容</b>；'
             '整理完按 <b>Ctrl+Shift+Z</b> 可以退回去。</p>'
-            '<p><b>运行怎么用：</b>按 <b>F9</b> 会开一个系统命令行窗口来运行程序，'
-            '这样 <code>scanf</code> 可以真正交互输入；'
-            '想不弹窗、直接在下面看输出，用 <b>Shift+F9</b>。</p>'
+            '<p><b>运行怎么用：</b>按 <b>F9</b> 直接编译并运行，输出显示在下方'
+            '「运行输出」页——<b>不会弹出黑色命令行窗口</b>。'
+            '程序要输入（<code>scanf</code>）时，先把要输入的文字填进工具栏上方的'
+            '输入框再运行；超过设定秒数会自动终止（防止死循环）。</p>'
             '<p><b>常用头文件：</b>打 <code>inc</code> 会出现 <code>include</code> 片段，'
             '下拉里可以选 stdio / stdlib / string / math / <b>time</b> / ctype；'
             '这些库的常用函数（<code>time</code>、<code>ctime</code>、'
@@ -1615,7 +1729,7 @@ class MainWindow(QMainWindow):
             '<div style="font-family:\'Microsoft YaHei\',sans-serif;font-size:11pt;'
             'color:#6B7280;padding:16px;line-height:1.9;">'
             '按 <b>F5</b> 或点工具栏的「检查」，讲解会显示在这里。<br>'
-            '按 <b>F9</b> 会在系统命令行窗口里运行程序（scanf 可以交互输入）。<br>'
+            '按 <b>F9</b> 直接运行，结果显示在「运行输出」页（不弹黑框）。<br>'
             '<span style="font-size:10pt;">想再看一遍使用说明：按 <b>F1</b>，'
             '或菜单「帮助 → 使用说明」。</span>'
             '</div>')
@@ -2024,8 +2138,11 @@ class MainWindow(QMainWindow):
                 self._ctx_dump_done = True
                 self._write_ctx_dump("Qt 原生菜单", texts)
             return
-        # ---- 2. 网页菜单的现场快照（只在前 3 分钟查，之后不再打扰）----
-        if self._ctx_dump_done or not self.editor.monaco or self._ctx_js_ticks > 240:
+        # ---- 2. 网页菜单的现场快照 ----
+        # 这是排查用途：正常使用时不抓（每次启动要白跑 240 次页面 JS，
+        # 只为存一份"菜单长什么样"的现场）。需要时设 CTUTOR_MENU_DEBUG=1 再启。
+        if (not _MENU_DEBUG or self._ctx_dump_done
+                or not self.editor.monaco or self._ctx_js_ticks > 240):
             return
         self._ctx_js_ticks += 1
         self.editor.eval_js(
@@ -2534,7 +2651,7 @@ class MainWindow(QMainWindow):
                           % html.escape(tb))
 
     # ---------- 运行 ----------
-    def _start_run(self, mode: str):
+    def _start_run(self):
         if self.run_worker is not None and self.run_worker.isRunning():
             return
         if self.worker is not None and self.worker.isRunning():
@@ -2544,25 +2661,118 @@ class MainWindow(QMainWindow):
         self.status.showMessage("正在编译…")
         self.btn_run.setEnabled(False)
         self.btn_check.setEnabled(False)
-        if mode == "panel":
-            self.tabs.setCurrentIndex(1)        # 切到「运行输出」页
-            self.view_run.setHtml('<div style="font-family:\'Microsoft YaHei\';'
-                                  'padding:10px;color:#6B7280;">正在编译并运行…</div>')
-        self.run_worker = RunWorker(working, self.txt_input.toPlainText(), enc, None,
-                                    self.spin_timeout.value(), mode, self)
+        # 直接切到「运行输出」页：不弹黑框，结果就在这一页里
+        self.tabs.setCurrentIndex(1)
+        self._run_streamed = False
+        self.view_run.setPlainText("正在编译并运行…\n")
+        # 输入框里已有的内容作为第一批输入一次性喂进去；然后清空，
+        # 运行中这一栏就是"边跑边答"的输入行。
+        initial = self.txt_input.toPlainText()
+        self.txt_input.clear()
+        self.run_worker = RunWorker(working, initial, enc, None,
+                                    self.spin_timeout.value(), self)
+        self.run_worker.chunk.connect(self._on_run_chunk)
         self.run_worker.done.connect(self._on_run_done)
         self.run_worker.failed.connect(self._on_run_failed)
         self.run_worker.start()
+        self.btn_send_input.setEnabled(True)
+        self.btn_end_input.setEnabled(True)
+        # 盯着"突然不出声了"：多半是程序停在 scanf 上等人输入，
+        # 不提示的话学生只会看到一片空白，以为程序卡死、运行很慢。
+        self._last_chunk_at = time.time()
+        self._idle_hint_shown = False
+        self._run_watch.start()
 
     def do_run(self):
-        """F9：在系统命令行窗口里运行。scanf 能真正交互输入，和书上的行为一致。"""
-        self._start_run("console")
+        """F9：编译并运行，输出直接显示在面板的「运行输出」页（不弹命令行窗口）。"""
+        self._start_run()
 
-    def do_run_panel(self):
-        """Shift+F9：在面板内运行并捕获输出，不弹窗口。"""
-        self._start_run("panel")
+    def _on_run_chunk(self, text: str):
+        """程序还在跑时就把输出贴上来——不用等它结束，学生能马上看到结果。"""
+        if not text:
+            return
+        text = text.replace("\r\n", "\n").replace("\r", "\n")
+        if not getattr(self, "_run_streamed", False):
+            self._run_streamed = True
+            self.view_run.setPlainText("")       # 清掉"正在编译并运行…"
+        self._last_chunk_at = time.time()
+        cur = self.view_run.textCursor()
+        cur.movePosition(QTextCursor.End)
+        cur.insertText(text)
+        self.view_run.setTextCursor(cur)
+        self.view_run.ensureCursorVisible()
+
+    def _tick_run_watch(self):
+        """运行中每 0.5 秒看一眼：是不是已经憋了 2.5 秒没吐字了。"""
+        w = self.run_worker
+        if w is None or not w.isRunning():
+            self._run_watch.stop()
+            return
+        if getattr(self, "_idle_hint_shown", True):
+            return
+        if time.time() - getattr(self, "_last_chunk_at", 0) < 2.5:
+            return
+        self._idle_hint_shown = True
+        self._append_note(
+            "（已经 2 秒没有新输出了：如果程序在等 scanf，请在下面输入框里"
+            "输入后回车；输完了点「结束输入」。如果它不需要输入，可能是在算，稍等。）")
+
+    def _send_input(self):
+        """把输入框里的这一行送进正在运行的程序（半交互）。
+
+        为什么要在输出里回显一遍：程序的标准输入是管道，不是终端——没有 tty
+        就不会把学生敲的字回显出来。不回显的话，界面上只看到程序注意一句接一句，
+        完全不知道"我刚才到底输了什么"。
+        """
+        w = self.run_worker
+        if w is None or not w.isRunning():
+            self.status.showMessage("程序没在运行——先按 F9；运行中才能在这里输入")
+            return
+        text = self.txt_input.toPlainText()
+        if not text.strip():
+            # 空着按回车 = 结束输入：学生不用先去点按钮，回车最顺手
+            self._end_input()
+            return
+        w.send(text)
+        self._append_echo(text)
+        self.txt_input.clear()
+        self.txt_input.setFocus()
+
+    def _end_input(self):
+        """告诉程序"没有更多输入了"（EOF）。
+
+        为什么需要它：`while (scanf(...) != EOF)`、`gets` 循环这类程序，
+        只有读到 EOF 才会往下走；不给 EOF 就只能等到超时被杀，看起来像"卡死"。
+        """
+        w = self.run_worker
+        if w is None or not w.isRunning():
+            self.status.showMessage("程序没在运行——先按 F9；运行中才能结束输入")
+            return
+        if not w.end_input():
+            return
+        self._append_note("—— 已结束输入（程序读到 EOF）——")
+        # EOF 之后程序不会再读 stdin，两个按钮都收起来，免得学生白点
+        self.btn_send_input.setEnabled(False)
+        self.btn_end_input.setEnabled(False)
+
+    def _append_note(self, text: str):
+        cur = self.view_run.textCursor()
+        cur.movePosition(QTextCursor.End)
+        cur.insertText(text + "\n")
+        self.view_run.setTextCursor(cur)
+        self.view_run.ensureCursorVisible()
+
+    def _append_echo(self, text: str):
+        cur = self.view_run.textCursor()
+        cur.movePosition(QTextCursor.End)
+        cur.insertText("› " + text.replace("\r\n", "\n").rstrip("\n") + "\n")
+        self.view_run.setTextCursor(cur)
+        self.view_run.ensureCursorVisible()
 
     def _on_run_failed(self, tb: str):
+        self.btn_send_input.setEnabled(False)
+        self.btn_end_input.setEnabled(False)
+        self._run_watch.stop()
         self.btn_run.setEnabled(True)
         self.btn_check.setEnabled(True)
         self.status.showMessage("运行失败")
@@ -2575,6 +2785,9 @@ class MainWindow(QMainWindow):
 
         self.btn_run.setEnabled(True)
         self.btn_check.setEnabled(True)
+        self.btn_send_input.setEnabled(False)
+        self.btn_end_input.setEnabled(False)
+        self._run_watch.stop()
 
         if not res.compiled:
             # 编译没过：不在"运行输出"里堆一大堆编译器原文，但**第一条要留**——
@@ -2598,24 +2811,46 @@ class MainWindow(QMainWindow):
             return
 
         text = run_mod.format_result(res)
-        # 用 <pre> 原样呈现：程序输出里的空格、缩进、制表符都是内容的一部分
+        # 用 <pre> 原样呈现：程序输出里的空格、缩进、制表符都是内容的一部分。
+        # 已经边跑边贴过输出时只补一行结尾小结，不整段重画——否则屏幕会闪一下，
+        # 而且学生刚看到的内容会被"重排"。
         self.tabs.setCurrentIndex(1)
-        self.view_run.setHtml(
-            '<pre style="font-family:Consolas,\'Microsoft YaHei\',monospace;'
-            'font-size:11pt;white-space:pre-wrap;margin:10px;">%s</pre>' % html.escape(text))
+        if getattr(self, "_run_streamed", False):
+            self._append_run_footer(res)
+        else:
+            self.view_run.setHtml(
+                '<pre style="font-family:Consolas,\'Microsoft YaHei\',monospace;'
+                'font-size:11pt;white-space:pre-wrap;margin:10px;">%s</pre>'
+                % html.escape(text))
 
         # 状态栏要给"具体是哪一种失败"，不能笼统说一句"没成功" ——
         # 「多半是死循环」这类提示是初学者最需要的那句话。
         if res.timed_out:
-            self.status.showMessage("运行超时已终止（多半是死循环，检查循环条件和 i++）")
-        elif res.ok and "系统命令行" in " ".join(res.notes):
-            self.status.showMessage("已在系统命令行窗口里运行（在那边输入和查看输出）")
+            self.status.showMessage(
+                "运行超时已终止（可能在等输入，也可能是死循环——看下方提示）")
         elif res.ok:
             self.status.showMessage("运行结束　用时 %.2f 秒" % res.duration)
         elif res.exit_code:
             self.status.showMessage("程序异常退出（返回码 %d），原因见下方" % res.exit_code)
         else:
             self.status.showMessage("运行没有成功，详情见下方")
+
+    def _append_run_footer(self, res):
+        """输出是边跑边贴的，结束后只在末尾补一小段小结（不再整段重画）。"""
+        lines = [""]
+        for n in (res.notes or []):
+            lines.append("· " + n)
+        if res.timed_out:
+            lines.append("—— 超时被强制终止 ——")
+        elif res.ok:
+            lines.append("—— 运行结束，用时 %.2f 秒 ——" % res.duration)
+        else:
+            lines.append("—— 程序异常结束，返回码 %d ——" % res.exit_code)
+        cur = self.view_run.textCursor()
+        cur.movePosition(QTextCursor.End)
+        cur.insertText("\n".join(lines) + "\n")
+        self.view_run.setTextCursor(cur)
+        self.view_run.ensureCursorVisible()
 
     def _on_done(self, rep: dict):
         self.btn_check.setEnabled(True)
@@ -2693,7 +2928,7 @@ class MainWindow(QMainWindow):
                      '（共 %d 条诊断，这里只讲最可能相关的一条）</div>' % len(diags))
             if len(diags) >= 3:
                 extra += ('<div style="color:#B45309;font-size:10pt;margin-bottom:8px;">'
-                          '提示：一次报很多条通常**不是很多个错误**——'
+                          '提示：一次报很多条通常<b>不是很多个错误</b>——'
                           '第一条往往是根因，修好它之后后面那些多半会一起消失。'
                           '先只改下面讲的那一处，再重新检查。</div>')
         self._explanation_html = "".join(head) + extra + render_mod.render_html(e, depth)
@@ -2715,6 +2950,13 @@ class MainWindow(QMainWindow):
         **之前**就能看到它，从根上绕开这个问题，也顺便省掉"窗口是否活跃"的前提。
         """
         try:
+            # 输入框里回车 = 把这一行送进正在运行的程序（Shift+回车还是换行）
+            if (ev.type() == QEvent.KeyPress
+                    and obj is getattr(self, "txt_input", None)
+                    and ev.key() in (Qt.Key_Return, Qt.Key_Enter)
+                    and not (ev.modifiers() & Qt.ShiftModifier)):
+                self._send_input()
+                return True
             if ev.type() == QEvent.KeyPress and (ev.modifiers() & Qt.ControlModifier):
                 k = ev.key()
                 if k in (Qt.Key_Equal, Qt.Key_Plus):

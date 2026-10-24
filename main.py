@@ -33,6 +33,7 @@ def _usage() -> str:
   ctutor check 你的代码.c    命令行：分层解释报错
   ctutor check 你的代码.c -o report.json
   ctutor fix 你的代码.c      [实验性] 确定性修复并重新编译验证
+  ctutor run 你的代码.c      编译并运行（可 --input 喂 scanf 的输入）
   ctutor kb                  知识库统计与 Top-20 命中率
   ctutor pending             待补清单（未收录的错误码）
   ctutor doctor              环境与配置自检
