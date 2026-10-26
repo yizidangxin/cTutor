@@ -10,7 +10,7 @@ from typing import Any, Dict, Optional
 
 from . import render
 
-TOOL_VERSION = "0.6.1"
+TOOL_VERSION = "0.6.2"
 REPORT_SCHEMA = "ctutor/report/1"
 
 

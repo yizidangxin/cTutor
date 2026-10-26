@@ -215,6 +215,83 @@ int main(void) {
           joined[:60])
     check("流式输出：stderr 也并进同一股，顺序不乱", "E1" in joined, joined[:60])
 
+    # 学生写程序**不会**在后面跟 fflush：printf 完就 Sleep / 等输入。
+    # 重定向到管道时 C 运行时默认按 4KB 块缓冲，面板上会一直空着，直到程序退出——
+    # 这就是"输出不实时"。编译器里强制包含了 _ctutor_rt.h 把 stdout 设成不缓冲。
+    src_rt = write_case("realtime.c", """#include <stdio.h>
+#include <windows.h>
+int main(void) {
+    printf("A\\n");
+    Sleep(500);
+    printf("B\\n");
+    Sleep(500);
+    printf("C\\n");
+    return 0;
+}
+""")
+    rt_stamps = []
+    t_rt = _time.perf_counter()
+    res_rt = run_mod.run_once(src_rt, os.path.join(WORK, "t_realtime"), timeout=30,
+                              source_encoding="utf-8", compiler=comp,
+                              on_output=lambda t: rt_stamps.append(
+                                  (_time.perf_counter() - t_rt, t)))
+    rt_total = _time.perf_counter() - t_rt
+    rt_joined = "".join(t for _, t in rt_stamps)
+    check("实时输出：不写 fflush 也是边跑边出来（≥3 批）", len(rt_stamps) >= 3,
+          len(rt_stamps))
+    check("实时输出：最后一块比第一块晚 0.5 秒以上（说明是陆续到的）",
+          len(rt_stamps) >= 2 and rt_stamps[-1][0] - rt_stamps[0][0] > 0.5,
+          (round(rt_stamps[0][0], 2), round(rt_stamps[-1][0], 2)) if rt_stamps else None)
+    check("实时输出：三行都没丢", "A" in rt_joined and "B" in rt_joined
+          and "C" in rt_joined and rt_total > 0.9, rt_joined[:60])
+
+    # printf("请输入 n: ") 结尾没有换行，最容易"看不见"：只按行切的话它永远发不出去
+    src_half = write_case("half.c", """#include <stdio.h>
+#include <windows.h>
+int main(void) {
+    printf("请输入 n: ");
+    Sleep(600);
+    printf("(收到)\\n");
+    return 0;
+}
+""")
+    half_stamps = []
+    t_half = _time.perf_counter()
+    run_mod.run_once(src_half, os.path.join(WORK, "t_half"), timeout=30,
+                     source_encoding="utf-8", compiler=comp,
+                     on_output=lambda t: half_stamps.append(
+                         (_time.perf_counter() - t_half, t)))
+    half_texts = [t for _, t in half_stamps]
+    check("实时输出：没有换行的提示（printf(\"请输入 n: \")）也会先出来",
+          any("请输入" in t and "(收到" not in t for t in half_texts), half_texts[:4])
+    check("实时输出：那个提示比程序结束早 0.4 秒以上到",
+          any("请输入" in t and ts < half_stamps[-1][0] - 0.4
+              for ts, t in half_stamps), half_stamps[:4])
+
+    # 中文串：UTF-8 源码不告诉 cl 就会按 936 读，实测会出乱码甚至丢字
+    src_cn = write_case("cn.c", """#include <stdio.h>
+int main(void) { printf("第一行\\n第二行\\n"); return 0; }
+""")
+    res_cn = run_mod.run_once(src_cn, os.path.join(WORK, "t_cn"), timeout=30,
+                              source_encoding="utf-8", compiler=comp)
+    check("中文串：UTF-8 源码里的中文输出完好（没有乱码/丢字）",
+          "第一行" in res_cn.stdout and "第二行" in res_cn.stdout,
+          res_cn.stdout[:60])
+
+    src_cn_gbk = write_case("cn_gbk.c", """#include <stdio.h>
+int main(void) { printf("第一行\\n第二行\\n"); return 0; }
+""", enc="gbk")
+    res_cn_gbk = run_mod.run_once(src_cn_gbk, os.path.join(WORK, "t_cn_gbk"), timeout=30,
+                                  source_encoding="gbk", compiler=comp)
+    check("中文串：GBK 的教材代码也完好",
+          "第一行" in res_cn_gbk.stdout and "第二行" in res_cn_gbk.stdout,
+          res_cn_gbk.stdout[:60])
+
+    check("实时输出：_keep_tail 会把被截断的汉字尾巴留到下一次",
+          compilers._keep_tail("第一".encode("utf-8")[:-1]) == "一".encode("utf-8")[:-1],
+          compilers._keep_tail("第一".encode("utf-8")[:-1]))
+    check("实时输出：完整内容不会被误留", compilers._keep_tail(b"abc\n") == b"")
+
     src_loop2 = write_case("loop2.c", """#include <stdio.h>
 #include <windows.h>
 int main(void) { int i = 0; for (;;) { printf("tick %d\\n", i++); fflush(stdout); Sleep(100); } }

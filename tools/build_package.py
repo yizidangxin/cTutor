@@ -52,7 +52,7 @@ TOOLCHAIN_SRC = os.path.join(PACK, "w64devkit", "w64devkit")
 
 from engine import config as config_mod                     # noqa: E402
 
-VERSION = "0.6.1"
+VERSION = "0.6.2"
 
 # ---- w64devkit 瘦身清单（只删对纯 C 教学确定无用的东西）----
 DROP_DIRS = [

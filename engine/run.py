@@ -124,6 +124,9 @@ def _cache_key(source: str, compiler, cfg: dict) -> str:
         getattr(compiler, "name", "?"),
         getattr(compiler, "vcvars", "") or getattr(compiler, "gcc", ""),
         c.get("std", "c17"), bool(c.get("warnings", True)))).encode("utf-8"))
+    # 编译时强制包含的"实时输出"头文件也算一份：内容变了就不能复用旧 exe，
+    # 否则学生拿到的还是块缓冲的老程序（输出照样憋到退出才出来）。
+    h.update(compilers_mod.UNBUFFER_VERSION.encode("utf-8"))
     return h.hexdigest()[:16]
 
 
@@ -186,7 +189,7 @@ def run_once(source: str, workdir: str, stdin_text: str = "",
         result.compiled = True
         result.exe = cached
     else:
-        res = compiler.compile(source, workdir)
+        res = compiler.compile(source, workdir, source_encoding=source_encoding)
         result = RunResult(diagnostics=list(res.diagnostics or []), exe=res.exe or "")
         if not res.ok:
             result.compiled = False

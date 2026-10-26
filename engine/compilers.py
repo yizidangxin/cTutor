@@ -24,7 +24,7 @@ from . import config as config_mod
 from . import sarif as sarif_mod
 from . import textparse
 from .diagnostic import Diagnostic, dedupe
-from .encoding import decode_output, smart_decode
+from .encoding import decode_output, detect_source_encoding, smart_decode
 
 _BENIGN = ("The system cannot find the path specified.",
            "系统找不到指定的路径。")
@@ -76,14 +76,79 @@ def _child_env(workdir: str, base: Optional[dict] = None) -> dict:
     return env
 
 
-def _pump_stream(pipe, sink, collected, fallback, max_bytes, state):
-    """边读边发：把子进程输出按行解码后交给 sink，同时攒原始字节给返回值。
+class _StreamReader(threading.Thread):
+    """在自己的线程里阻塞读管道，别人用 take() 带超时地取走攒到的字节。
 
-    为什么要按行切：UTF-8/GBK 的多字节字符不会包含 0x0A，所以按 `\\n` 切开的
-    每段都是完整字符，逐段解码不会把汉字劈成两半（半截字节解码出来是乱码）。
-    **每次读到数据就把攒下的完整行发出去**——不能等"攒够 8 行"或定时器：
-    程序打印一行后开始算东西（或等输入）时，那一行会一直卡在缓冲区里，
-    表现出来就是"明明有输出，面板上却空着"。
+    为什么不直接 peek 管道：`read1()` 没有数据时会一直阻塞，光靠它没法判断
+    "程序已经打印了半行、正在等输入"——那半行会卡在读取线程手里，面板上就是不显示。
+    （`PeekNamedPipe` 看起来正好，但实测在本机管道上永远返回 0 字节，不可靠。）
+    所以：读线程只管读，主循环按 50ms 的节奏取，取不到就看要不要把半行先发出去。
+    """
+
+    def __init__(self, pipe):
+        super().__init__(name="ctutor-read", daemon=True)
+        self._pipe = pipe
+        self._buf = bytearray()
+        self._done = False
+        self._cv = threading.Condition()
+
+    def run(self):
+        try:
+            while True:
+                data = self._pipe.read1(8192)
+                if not data:
+                    break
+                with self._cv:
+                    self._buf += data
+                    self._cv.notify_all()
+        except Exception:                                       # noqa: BLE001
+            pass
+        finally:
+            with self._cv:
+                self._done = True
+                self._cv.notify_all()
+
+    def take(self, timeout: float) -> bytes:
+        """最多等 timeout 秒，把攒到的字节整块取走（没有就是 b""）。"""
+        with self._cv:
+            if not self._buf and not self._done:
+                self._cv.wait(timeout)
+            out = bytes(self._buf)
+            del self._buf[:]
+            return out
+
+    @property
+    def done(self) -> bool:
+        return self._done
+
+
+def _keep_tail(raw: bytes) -> bytes:
+    """末尾可能是"被截断的多字节字符"时，留到下次再解码（否则出乱码）。"""
+    # UTF-8 前导字节：110xxxxx / 1110xxxx / 11110xxx
+    for k in (1, 2, 3):
+        if len(raw) < k:
+            return raw
+        head = raw[-k]
+        tail = raw[-k + 1:]
+        if head & 0xE0 == 0xC0 and k == 1:
+            return raw[-1:]
+        if head & 0xF0 == 0xE0 and k == 2 and all(b & 0xC0 == 0x80 for b in tail):
+            return raw[-2:]
+        if head & 0xF8 == 0xF0 and k == 3 and all(b & 0xC0 == 0x80 for b in tail):
+            return raw[-3:]
+    return b""
+
+
+def _pump_stream(pipe, sink, collected, fallback, max_bytes, state):
+    """边读边发：把子进程输出解码后交给 sink，同时攒原始字节给返回值。
+
+    两条路：
+      · 有独立的读线程（见 _StreamReader）：没数据时按 50ms 节奏看，
+        **顺手把停了一会儿的半行发出去**。学生写 `printf("请输入 n: ")`
+        （结尾没有换行）再 `scanf`，只靠"按行切"的话这个提示永远发不出去，
+        看起来就是"程序没反应"。
+    完整的一行优先：UTF-8/GBK 的多字节字符不会包含 0x0A，按 `\\n` 切开再解码
+    不会把汉字劈成两半。
     """
     buf = b""
     batch = []
@@ -100,16 +165,35 @@ def _pump_stream(pipe, sink, collected, fallback, max_bytes, state):
         else:
             state["truncated"] = True
 
+    def take(data):
+        nonlocal buf
+        buf += data
+        while b"\n" in buf:
+            line, buf = buf.split(b"\n", 1)
+            batch.append(line + b"\n")
+        flush()
+
+    reader = _StreamReader(pipe)
+    reader.start()
     try:
+        last_data = time.monotonic()
         while True:
-            data = pipe.read1(8192)
-            if not data:
+            data = reader.take(0.05)
+            if data:
+                take(data)
+                last_data = time.monotonic()
+                continue
+            if reader.done:
                 break
-            buf += data
-            while b"\n" in buf:
-                line, buf = buf.split(b"\n", 1)
-                batch.append(line + b"\n")
-            flush()
+            # 没有新数据：半行（printf 没换行）等够了就发，别让学生对着空屏
+            if buf and time.monotonic() - last_data >= 0.12:
+                keep = _keep_tail(buf)
+                cut = len(buf) - len(keep) if keep else len(buf)
+                if cut > 0:
+                    batch.append(buf[:cut])
+                    buf = buf[cut:]
+                    flush()
+                last_data = time.monotonic()
         if buf:
             batch.append(buf)
         flush()
@@ -137,6 +221,70 @@ def _pump_stdin(pipe, queue, encoding: str) -> None:
             pipe.close()
         except Exception:                                   # noqa: BLE001
             pass
+
+
+# --------------------------------------------------------------- 实时输出
+# 程序的标准输出被接到管道上时，C 运行时默认是**块缓冲**（4KB 左右）：
+# printf 一行 → 先攒在缓冲区里，攒满或者程序退出才真的写出来。
+# 于是"边跑边显示"在面板上根本看不出来：程序打印完在算东西/等输入，
+# 界面上一个字都没有，直到它结束才"唰"地全出来。
+# 解决办法是在 main 之前把 stdout 改成行缓冲（有换行就立刻刷），
+# 用编译器自带的"强制包含"参数把下面这个头文件塞进每个被编译的程序里：
+#   MSVC: /FI<file>      GCC: -include <file>
+_UNBUFFER_HEADER = """\
+/* ctutor: make printf() show up immediately in the panel.
+ *
+ * When stdout is redirected to a pipe, the C runtime buffers it (about 4KB),
+ * so nothing appears until the buffer is full or the program exits -- which
+ * looks like "the output is not real-time".
+ * This header switches stdout/stderr to unbuffered before main() runs.
+ * (_IOLBF is NOT an option: UCRT treats line buffering as full buffering,
+ *  see tools/probe_unbuffer.py for the measurement.)
+ *
+ * Keep this file ASCII-only: it is force-included into every program we
+ * compile, and MSVC reads it with the source charset (cp936 for GBK files).
+ */
+#include <stdio.h>
+
+static void ctutor_unbuffer_streams(void)
+{
+    setvbuf(stdout, NULL, _IONBF, 0);
+    setvbuf(stderr, NULL, _IONBF, 0);
+}
+
+#if defined(_MSC_VER)
+/* MSVC: a function pointer in a CRT init section runs before main() */
+#pragma section(".CRT$XIU", long, read)
+__declspec(allocate(".CRT$XIU"))
+static void (__cdecl *ctutor_unbuffer_ptr)(void) = ctutor_unbuffer_streams;
+#else
+/* GCC / Clang: constructor attribute, also before main() */
+__attribute__((constructor)) static void ctutor_unbuffer_ctor(void)
+{
+    ctutor_unbuffer_streams();
+}
+#endif
+"""
+
+# 改了上面的头文件就要改这个版本号：它进编译缓存的键，否则旧 exe 会一直被复用
+UNBUFFER_VERSION = "unbuffer-3"
+
+
+def _is_utf8(enc: Optional[str]) -> bool:
+    """这个编码名是不是 UTF-8（含带 BOM 的写法）。"""
+    n = (enc or "").strip().lower().replace("-", "").replace("_", "")
+    return n in ("utf8", "utf8bom", "utf8sig")
+
+
+def _unbuffer_header(workdir: str) -> str:
+    """把"实时输出"头文件写进工作目录，返回它的路径（签名用）。"""
+    path = os.path.join(workdir, "_ctutor_rt.h")
+    try:
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(_UNBUFFER_HEADER)
+    except OSError:
+        return ""
+    return path
 
 
 class _CpuClock:
@@ -462,8 +610,19 @@ class Compiler:
         self.warnings = bool(c.get("warnings", True))
 
     def compile(self, source: str, workdir: str, std: Optional[str] = None,
-                warnings: Optional[bool] = None) -> CompileResult:
+                warnings: Optional[bool] = None,
+                source_encoding: Optional[str] = None) -> CompileResult:
         raise NotImplementedError
+
+    @staticmethod
+    def _encoding_for(source: str, source_encoding: Optional[str]) -> Optional[str]:
+        """没传编码就自己看一眼源文件（GBK 的教材代码 / UTF-8 的编辑器代码都能认）。"""
+        if source_encoding:
+            return source_encoding
+        try:
+            return detect_source_encoding(source)
+        except OSError:
+            return None
 
     # ---- 公共后处理：SARIF 优先，文本兜底 ----
     def _finalize(self, res: CompileResult) -> CompileResult:
@@ -586,9 +745,11 @@ class MsvcCompiler(Compiler):
         return {"env": env, "cl": cl}
 
     def compile(self, source: str, workdir: str, std: Optional[str] = None,
-                warnings: Optional[bool] = None) -> CompileResult:
+                warnings: Optional[bool] = None,
+                source_encoding: Optional[str] = None) -> CompileResult:
         std = std or self.std
         warnings = self.warnings if warnings is None else warnings
+        source_encoding = self._encoding_for(source, source_encoding)
         os.makedirs(workdir, exist_ok=True)
         sarif_path = os.path.join(workdir, "diagnostics.sarif")
         if os.path.exists(sarif_path):
@@ -599,6 +760,14 @@ class MsvcCompiler(Compiler):
         if warnings:
             flags.append("/W4")
         flags.append('/experimental:log "%s"' % sarif_path)
+        # UTF-8 源码必须显式告诉 cl：默认按本机 ANSI（936）读，中文串会被改坏——
+        # 实测 "第一行" 会变成字节残缺的乱码（"入" 那个字节直接变成 '?'）。
+        # 带 BOM 的文件 cl 能自己认出来，这里一并加上也无害。
+        if _is_utf8(source_encoding):
+            flags.append("/utf-8")
+        rt_h = _unbuffer_header(workdir)
+        if rt_h:
+            flags.append('/FI"%s"' % rt_h)          # 强制包含：让 printf 立刻出来
         cl_line = 'cl %s "%s"' % (" ".join(flags), source)
 
         # ---- 快路径：直接带 vcvars 环境调 cl.exe（跳过每次 1.8 秒的环境初始化）----
@@ -608,6 +777,8 @@ class MsvcCompiler(Compiler):
             code, raw_out, raw_err, timed_out, truncated = run_safely(
                 [cl, "/nologo", "/std:%s" % std, "/diagnostics:caret"]
                 + (["/W4"] if warnings else [])
+                + (["/utf-8"] if _is_utf8(source_encoding) else [])
+                + (['/FI' + rt_h] if rt_h else [])
                 + ["/experimental:log", sarif_path, source],
                 workdir, self.timeout, self.max_bytes, base_env=env)
             if code != -1:                    # -1 = 进程根本没起来
@@ -665,9 +836,11 @@ class GccCompiler(Compiler):
         return args
 
     def compile(self, source: str, workdir: str, std: Optional[str] = None,
-                warnings: Optional[bool] = None) -> CompileResult:
+                warnings: Optional[bool] = None,
+                source_encoding: Optional[str] = None) -> CompileResult:
         std = std or self.std
         warnings = self.warnings if warnings is None else warnings
+        source_encoding = self._encoding_for(source, source_encoding)
         os.makedirs(workdir, exist_ok=True)
         sarif_path = os.path.join(workdir, "diagnostics.sarif")
         if os.path.exists(sarif_path):
@@ -675,6 +848,13 @@ class GccCompiler(Compiler):
         exe = os.path.join(workdir, "a.exe")
 
         base = [self.gcc] + self._base_args(std, warnings)
+        # GCC 默认就按 UTF-8 读源码、按 UTF-8 输出字符串，这里只是把话说清楚，
+        # 免得换了 locale 之后中文串悄悄变样。
+        if _is_utf8(source_encoding):
+            base += ["-finput-charset=UTF-8", "-fexec-charset=UTF-8"]
+        rt_h = _unbuffer_header(workdir)
+        if rt_h:
+            base += ["-include", rt_h]      # 强制包含：让 printf 立刻出来
         variants = [
             # 首选：显式指定 SARIF 输出文件（GCC 14+）
             ["-fno-diagnostics-json-formatting",

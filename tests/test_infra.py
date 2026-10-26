@@ -121,14 +121,15 @@ if comp is not None and comp.name == "msvc":
                 '    printf("%d\\n", x);\n    return 0;\n}\n')
     res = comp.compile(src, os.path.join(WORK, "sc"))
     raw = open(res.sarif_path, "rb").read()
-    strict_ok = True
-    try:
-        raw.decode("utf-8")
-    except UnicodeDecodeError:
-        strict_ok = False
-    # 这个断言记录的是「MSVC 会产出非法 UTF-8 的 SARIF」这一现象本身
-    check("中文源码会让 MSVC 的 SARIF 含被截断的多字节字符（现象确认）",
-          not strict_ok, "本次恰好是合法 UTF-8（截断点落在字符边界）")
+    # MSVC 有时会把多字节字符砍在 UTF-8 序列中间（取决于截断点落在哪），
+    # 本机这次恰好没砍断——所以这里**手工造一份"砍断"的 SARIF**，
+    # 把容错解码这条路径本身钉住，不依赖编译器的临场表现。
+    cut_path = os.path.join(WORK, "sarif_cut.sarif")
+    with open(cut_path, "wb") as f:
+        f.write(raw.replace(b'"text": "', b'"text": "\xe4\xb8', 1))
+    cut_status = sarif.load_sarif(cut_path)[1]
+    check("SARIF 里被砍掉半个汉字时也能读（不抛异常、状态 ok）",
+          cut_status == "ok", cut_status)
     check("容错解码后 SARIF 仍可用（结构完好）",
           sarif.load_sarif(res.sarif_path)[1] == "ok",
           sarif.load_sarif(res.sarif_path)[1])
