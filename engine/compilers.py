@@ -17,6 +17,7 @@ import os
 import shutil
 import subprocess
 import threading
+import time
 from typing import List, Optional, Tuple
 
 from . import config as config_mod
@@ -138,12 +139,143 @@ def _pump_stdin(pipe, queue, encoding: str) -> None:
             pass
 
 
+class _CpuClock:
+    """读某个进程累计消耗的 CPU 秒数（Windows GetProcessTimes）。
+
+    用途只有一个：判断子进程**到底在干活，还是在等人输入**。
+    "停在 scanf 上"和"死循环空转"从外部看都是"没有输出、没有退出"，
+    但前者不占 CPU、后者把 CPU 吃满——这就是唯一可靠的区分依据。
+    量不到（非 Windows / 权限不足）时读出来是 None，调用方退回墙钟计时。
+    """
+
+    def __init__(self, pid: int):
+        self._h = None
+        self._k32 = None
+        self._ft = None
+        try:
+            import ctypes
+            from ctypes import wintypes
+            k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            k32.OpenProcess.restype = wintypes.HANDLE
+            k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            k32.GetProcessTimes.argtypes = [wintypes.HANDLE,
+                                            ctypes.POINTER(wintypes.FILETIME),
+                                            ctypes.POINTER(wintypes.FILETIME),
+                                            ctypes.POINTER(wintypes.FILETIME),
+                                            ctypes.POINTER(wintypes.FILETIME)]
+            handle = k32.OpenProcess(0x1000, False, pid)   # QUERY_LIMITED_INFORMATION
+            if handle:
+                self._h, self._k32 = handle, k32
+        except Exception:                                       # noqa: BLE001
+            self._h = None
+
+    def read(self) -> Optional[float]:
+        """累计 CPU 秒数（内核 + 用户）；拿不到返回 None。"""
+        if not self._h:
+            return None
+        try:
+            import ctypes
+            from ctypes import wintypes
+            created, exited, kern, user = (wintypes.FILETIME(), wintypes.FILETIME(),
+                                           wintypes.FILETIME(), wintypes.FILETIME())
+            ok = self._k32.GetProcessTimes(self._h, ctypes.byref(created),
+                                           ctypes.byref(exited), ctypes.byref(kern),
+                                           ctypes.byref(user))
+            if not ok:
+                return None
+
+            def secs(ft):
+                return ((ft.dwHighDateTime << 32) | ft.dwLowDateTime) / 1e7
+            return secs(kern) + secs(user)
+        except Exception:                                       # noqa: BLE001
+            return None
+
+    def close(self) -> None:
+        if self._h:
+            try:
+                self._k32.CloseHandle(self._h)
+            except Exception:                               # noqa: BLE001
+                pass
+            self._h = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        self.close()
+        return False
+
+
+def _kill_and_set(proc, code: int) -> None:
+    """连子进程树一起杀掉，并把返回码记成 code（-9 超时 / -15 手动停止）。"""
+    _kill_tree(proc.pid)
+    try:
+        proc.wait(5)
+    except Exception:                                       # noqa: BLE001
+        pass
+    proc.returncode = code
+
+
+def _wait_done(proc, timeout: int, chunks, interactive: bool,
+               stop_event=None) -> bool:
+    """等子进程结束，返回"是不是因为超时被杀"。
+
+    交互模式下不能拿墙钟当超时：程序停在 `scanf` 上等学生敲键盘时，
+    进程既不占 CPU、也不产生输出，这段"等人"的时间不该算进超时里——
+    否则学生想慢一点、或者去喝口水回来，程序就已经被判超时杀掉了。
+
+    所以只统计"进程真的在干活"的累计时间：
+      · CPU 时间在涨（在算），或者
+      · 又有新输出吐出来
+    两者都没有，就当它在等输入，这段时间不计时。
+    """
+    if not interactive:
+        try:
+            proc.wait(timeout=timeout)
+            return False
+        except subprocess.TimeoutExpired:
+            _kill_and_set(proc, -9)
+            return True
+
+    with _CpuClock(proc.pid) as clock:
+        worked = 0.0
+        last = time.monotonic()
+        last_cpu = clock.read()
+        mark = len(chunks)
+        while True:
+            if stop_event is not None and stop_event.is_set():
+                _kill_and_set(proc, -15)
+                return False
+            try:
+                proc.wait(0.15)          # 每 0.15 秒探一次：够灵敏，又不空转烧 CPU
+                return False
+            except subprocess.TimeoutExpired:
+                pass
+            now = time.monotonic()
+            dt = now - last
+            last = now
+            cpu = clock.read()
+            grew_out = len(chunks) > mark
+            mark = len(chunks)
+            if cpu is None or last_cpu is None:
+                busy = True                     # 量不到 CPU：退回墙钟，行为同以前
+            else:
+                busy = grew_out or (cpu - last_cpu) > 1e-4
+                last_cpu = cpu
+            if not busy:
+                continue                        # 在等人输入（或睡过去了）：不计时
+            worked += dt
+            if worked > timeout:
+                _kill_and_set(proc, -9)
+                return True
+
+
 def run_safely(args: List[str], workdir: str, timeout: int = 30,
                max_bytes: int = 2_000_000, stdin_text: Optional[str] = None,
                stdin_encoding: str = "utf-8",
                base_env: Optional[dict] = None,
                on_output=None, output_fallback: str = "utf-8",
-               stdin_queue=None,
+               stdin_queue=None, stop_event=None,
                ) -> Tuple[int, bytes, bytes, bool, bool]:
     """执行外部命令，返回 (返回码, stdout, stderr, 是否超时, 是否被截断)。
 
@@ -164,6 +296,10 @@ def run_safely(args: List[str], workdir: str, timeout: int = 30,
     stdin_queue 不为 None 时改成"半交互"：stdin 用管道，往里放字符串就送进程序、
     放 None 就表示没有更多输入。面板靠它实现"程序问一句、学生答一句"，
     又不用弹一个 cmd 控制台黑框。
+
+    半交互模式下超时按**"程序干活的时间"**累计，等学生输入的时间不算
+    （见 _wait_done）：学生想多久都不会被杀，只有真的把 CPU 吃满一直算
+    才会超时。stop_event 置位时立刻杀进程树（面板的「停止」按钮）。
     """
     interactive = stdin_queue is not None
     stdin_fh = None
@@ -208,16 +344,7 @@ def run_safely(args: List[str], workdir: str, timeout: int = 30,
                       chunks, output_fallback, max_bytes, state),
                 name="ctutor-output", daemon=True)
             reader.start()
-            try:
-                proc.wait(timeout=timeout)
-            except subprocess.TimeoutExpired:
-                timed_out = True
-                _kill_tree(proc.pid)
-                try:
-                    proc.wait(5)
-                except Exception:                           # noqa: BLE001
-                    pass
-                proc.returncode = -9
+            timed_out = _wait_done(proc, timeout, chunks, interactive, stop_event)
             reader.join(3)
             out, err = b"".join(chunks), b""
             truncated = bool(state["truncated"])

@@ -298,17 +298,46 @@ int main(void) {
     res_eof = run_mod.run_once(src_need2, os.path.join(WORK, "t_eof"), timeout=20,
                                source_encoding="utf-8", compiler=comp,
                                stdin_queue=q2)
-    src_wait = write_case("wait.c", """#include <stdio.h>
+    # 等学生输入的时间不算超时：timeout=1，但 2.5 秒后才送输入，程序必须活着
+    src_slow = write_case("slow.c", """#include <stdio.h>
 int main(void) { int n = 0; printf("输入位数\\n"); fflush(stdout);
-                  scanf("%d", &n); printf("%d\\n", n); return 0; }
+                  if (scanf("%d", &n) != 1) return 5; printf("%d\\n", n); return 0; }
 """)
-    q3 = queue.Queue()
-    res_wait = run_mod.run_once(src_wait, os.path.join(WORK, "t_wait"), timeout=3,
+    q4 = queue.Queue()
+    threading.Timer(2.5, lambda: q4.put("3\n")).start()
+    res_slow = run_mod.run_once(src_slow, os.path.join(WORK, "t_slow"), timeout=1,
                                 source_encoding="utf-8", compiler=comp,
-                                on_output=lambda t: None, stdin_queue=q3)
-    check("半交互超时：提示先问是不是在等输入，而不是武断说死循环",
-          res_wait.timed_out and any("输入" in n for n in res_wait.notes),
-          res_wait.notes)
+                                on_output=lambda t: None, stdin_queue=q4)
+    check("等输入不计时：慢慢敲（2.5 秒 > 超时 1 秒）也不会被杀",
+          (not res_slow.timed_out) and res_slow.exit_code == 0
+          and res_slow.stdout.strip().endswith("3"),
+          (res_slow.timed_out, res_slow.exit_code, res_slow.stdout))
+
+    # 但真的把 CPU 吃满一直算，照样要超时（不然死循环就没人管了）
+    src_spin = write_case("spin.c",
+                          "#include <stdio.h>\nint main(void){"
+                          "volatile int v = 0; while (1) { v = v + 1; } return 0; }\n")
+    res_spin = run_mod.run_once(src_spin, os.path.join(WORK, "t_spin"), timeout=2,
+                                source_encoding="utf-8", compiler=comp,
+                                on_output=lambda t: None, stdin_queue=queue.Queue())
+    check("只算输入不算超时：死循环照样会超时被杀",
+          res_spin.timed_out, (res_spin.timed_out, res_spin.exit_code))
+    check("交互模式下超时提示讲的是「连续算了多久」",
+          any("连着算" in n or "连续算" in n for n in res_spin.notes), res_spin.notes)
+
+    # 「停止」按钮走的路：stop_event 置位 → 立刻杀进程树，返回码 -15
+    src_stop = write_case("stopme.c",
+                          "#include <stdio.h>\nint main(void){"
+                          "volatile int v = 0; while (1) { v = v + 1; } return 0; }\n")
+    stop_ev = threading.Event()
+    threading.Timer(1.0, stop_ev.set).start()
+    res_stop = run_mod.run_once(src_stop, os.path.join(WORK, "t_stop"), timeout=60,
+                                source_encoding="utf-8", compiler=comp,
+                                on_output=lambda t: None, stdin_queue=queue.Queue(),
+                                stop_event=stop_ev)
+    check("手动停止：返回码 -15，且不报成「数组越界」那种错误",
+          res_stop.exit_code == -15 and any("手动停止" in n for n in res_stop.notes),
+          (res_stop.exit_code, res_stop.notes))
 
     check("半交互：送 EOF 后等输入的程序立刻结束",
           (not res_eof.timed_out) and res_eof.exit_code == 7,

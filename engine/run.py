@@ -158,7 +158,7 @@ def run_once(source: str, workdir: str, stdin_text: str = "",
              compiler: Optional[Any] = None,
              cfg: Optional[dict] = None,
              max_output: int = DEFAULT_MAX_OUTPUT,
-             on_output=None, stdin_queue=None) -> RunResult:
+             on_output=None, stdin_queue=None, stop_event=None) -> RunResult:
     """编译 source；只有编译通过才运行。
 
     on_output 不为 None 时把程序输出**实时**回调出去（面板用它边跑边显示），
@@ -212,7 +212,7 @@ def run_once(source: str, workdir: str, stdin_text: str = "",
         stdin_text=None if stdin_queue is not None else stdin_text,
         stdin_encoding=normalize_encoding(source_encoding),
         on_output=on_output, output_fallback=source_encoding,
-        stdin_queue=stdin_queue)
+        stdin_queue=stdin_queue, stop_event=stop_event)
     result.duration = time.time() - t0
     result.exit_code = code
     result.timed_out = timed_out
@@ -223,22 +223,22 @@ def run_once(source: str, workdir: str, stdin_text: str = "",
 
     if timed_out:
         if stdin_queue is not None:
-            # 半交互模式下"卡住"最常见的原因不是死循环，而是程序停在 scanf 上
-            # 等人输入。这种情况说成"死循环"会把学生带偏，必须先讲输入。
+            # 半交互模式下等输入的时间**不计入**超时（见 compilers._wait_done），
+            # 所以能走到这里的只有两种情况：真的在算，或者死循环空转后把人等烦。
             result.notes.append(
-                "程序运行超过 %d 秒还没结束，已强制终止。"
-                "先看是不是停在 scanf / gets 上等你输入：在输入框里输入后回车"
-                "（程序问几行就答几行），输完了点「结束输入」等它跑完。"
-                "如果它根本不需要输入，那要么是死循环（检查循环条件和 i++），"
-                "要么是这段程序本来就慢（比如循环一亿次）——把工具栏上的"
-                "超时秒数调大再跑。" % timeout)
+                "程序连续算了 %d 秒还没结束，已强制终止。"
+                "注意：等你输入的时间不算在内，所以这确实是它自己在跑。"
+                "常见原因是循环出不来（检查循环条件和 i++）、或者这段程序本来就要算很久"
+                "（比如 10^8 级循环）——后者把工具栏上的超时秒数调大再跑。" % timeout)
         else:
             result.notes.append(
                 "程序运行超过 %d 秒还没结束，已强制终止 —— 多半是死循环。"
                 "检查一下循环条件、循环变量有没有变化（比如忘了 i++）。" % timeout)
+    if code == -15:
+        result.notes.append("运行已被手动停止。")
     if truncated:
         result.notes.append("输出太长，只保留了前面一部分。")
-    if not result.ok and not timed_out:
+    if not result.ok and not timed_out and code != -15:
         reason = result.exit_reason()
         if reason:
             result.notes.append(reason)
@@ -312,7 +312,9 @@ def format_result(r: RunResult) -> str:
     if r.ok:
         header += "（正常结束，返回码 0，用时 %.2f 秒）" % r.duration
     elif r.timed_out:
-        header += "（超时被强制终止）"
+        header += "（连续算了太久，已终止）"
+    elif r.exit_code == -15:
+        header += "（已手动停止，用时 %.2f 秒）" % r.duration
     else:
         header += "（返回码 %d，用时 %.2f 秒）" % (r.exit_code, r.duration)
     lines.append("== " + header + " ==")

@@ -359,8 +359,8 @@ check("实时输出结束后只补小结、不重画已有内容",
 # 超时
 win3._on_run_done(run_mod.RunResult(compiled=True, ok=False, timed_out=True,
                                     exit_code=-9, duration=10.0))
-check("超时时：状态栏明确说超时（多半是死循环）",
-      "超时" in win3.status.currentMessage(), win3.status.currentMessage())
+check("超时时：状态栏明确说清是「算太久被终止」",
+      "算了太久" in win3.status.currentMessage(), win3.status.currentMessage())
 check("超时时：回车后按钮恢复可用（不能把界面锁死）", win3.btn_run.isEnabled())
 
 print()
@@ -1118,6 +1118,7 @@ class _StubWorker:
     def __init__(self):
         self.lines = []
         self.eofs = 0
+        self.stops = 0
 
     def isRunning(self):
         return True
@@ -1129,12 +1130,22 @@ class _StubWorker:
         self.eofs += 1
         return True
 
+    def stop(self):
+        self.stops += 1
+        return self.stops == 1
 
+
+_corner = win4.tabs.cornerWidget(_Qt.TopRightCorner)
+from PySide6.QtWidgets import QPushButton as _QPB               # noqa: E402
+_corner_btns = _corner.findChildren(_QPB) if _corner is not None else []
 check("「结束输入」按钮就挂在「运行输出」页签右边",
-      win4.tabs.cornerWidget(_Qt.TopRightCorner) is win4.btn_end_input)
+      win4.btn_end_input in _corner_btns, [b.text() for b in _corner_btns])
+check("「停止」按钮也在那儿（等输入不再算超时，得留个手动出口）",
+      win4.btn_stop_run in _corner_btns, [b.text() for b in _corner_btns])
 check("按钮说明里写了回车也能结束输入",
       "回车" in win4.btn_end_input.toolTip(), win4.btn_end_input.toolTip())
 check("没在运行时「结束输入」是灰的", not win4.btn_end_input.isEnabled())
+check("没在运行时「停止」也是灰的", not win4.btn_stop_run.isEnabled())
 
 stub = _StubWorker()
 win4.run_worker = stub
@@ -1155,6 +1166,22 @@ check("结束输入后两个按钮都收起（再点也送不进去了）",
 
 check("没在运行时点「结束输入」：只提示，不崩",
       "没在运行" in (win4._end_input() or win4.status.currentMessage()))
+
+# 「停止」：等输入不算超时以后，真卡住时得有个手动出口
+win4.view_run.setPlainText("")
+win4._stop_run()
+check("点「停止」：通知后台线程停，并在输出里说一声",
+      stub.stops == 1 and "正在终止" in win4.view_run.toPlainText(),
+      (stub.stops, win4.view_run.toPlainText()[-40:]))
+check("停止后「停止」按钮变灰（不会重复点）",
+      not win4.btn_stop_run.isEnabled())
+_stop_res = run_mod.RunResult(compiled=True, ok=False, exit_code=-15,
+                              duration=1.2, stdout="")
+win4._on_run_done(_stop_res)
+check("手动停止后的状态栏说明是「已手动停止」",
+      "手动停止" in win4.status.currentMessage(), win4.status.currentMessage())
+check("手动停止不会说成「程序异常结束，返回码 -15」",
+      "-15" not in win4.view_run.toPlainText(), win4.view_run.toPlainText()[-60:])
 win4.run_worker = None
 
 # 运行中突然不出声：多半是停在 scanf 上等人输入，要主动提示
@@ -1179,7 +1206,7 @@ win4._on_run_done(_timeout_res)
 check("超时的状态栏不再武断说「多半是死循环」",
       "等输入" in win4.status.currentMessage(), win4.status.currentMessage())
 check("超时后页面没有崩（结尾小结补在最后）",
-      "超时" in win4.view_run.toPlainText(), win4.view_run.toPlainText()[-60:])
+      "终止" in win4.view_run.toPlainText(), win4.view_run.toPlainText()[-60:])
 
 _w = panel.RunWorker(_tmp_path("x.c"), "", "utf-8", None, 10, None)
 check("EOF 只送一次（重复点不会提前关掉管道）",

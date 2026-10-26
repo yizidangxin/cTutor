@@ -419,6 +419,18 @@ class RunWorker(QThread):
         self._stdin = queue.Queue()
         self._eof_sent = False          # EOF 只能送一次，重复送会提前关掉管道
         self._eof_lock = threading.Lock()
+        self._stop = threading.Event()  # 「停止」按钮：引擎看到它就把进程树杀掉
+
+    def stop(self) -> bool:
+        """界面线程调用：立刻停止运行（连子进程一起杀）。重复点只算一次。"""
+        if self._stop.is_set():
+            return False
+        self._stop.set()
+        try:
+            self._stdin.put(None)       # 顺手关掉 stdin，程序若正好在读就立刻读到 EOF
+        except Exception:                                   # noqa: BLE001
+            pass
+        return True
 
     def send(self, text: str):
         """界面线程调用：给正在运行的程序送一行输入。"""
@@ -451,7 +463,8 @@ class RunWorker(QThread):
                                    source_encoding=self.source_encoding,
                                    compiler=comp,
                                    on_output=self.chunk.emit,
-                                   stdin_queue=self._stdin)
+                                   stdin_queue=self._stdin,
+                                   stop_event=self._stop)
             self.done.emit(res)
         except Exception:                                           # noqa: BLE001
             self.failed.emit(traceback.format_exc())
@@ -1382,7 +1395,9 @@ class MainWindow(QMainWindow):
         self.spin_timeout.setRange(1, 60)
         self.spin_timeout.setValue(10)
         self.spin_timeout.setSuffix(" 秒")
-        self.spin_timeout.setToolTip("面板内运行的最长时间，超过就强制终止（防止死循环卡住）")
+        self.spin_timeout.setToolTip(
+            "程序连续计算多久算超时（防止死循环卡住）。\n"
+            "等你在输入框里敲数据的时间不算在内——想多久都行。")
         self.cmb_depth = QComboBox()
         for i in range(1, 6):
             self.cmb_depth.addItem("讲到第 %d 层" % i, i)
@@ -1523,7 +1538,22 @@ class MainWindow(QMainWindow):
             "输入框空着按回车，效果相同。")
         self.btn_end_input.setEnabled(False)
         self.btn_end_input.clicked.connect(self._end_input)
-        self.tabs.setCornerWidget(self.btn_end_input, Qt.TopRightCorner)
+        # 「停止」：等输入的时间不算超时（见 engine/compilers.py 的 _wait_done），
+        # 好处是学生想多久都不会被杀，代价是"真的停不下来"时得有个手动出口。
+        self.btn_stop_run = QPushButton("停止")
+        self.btn_stop_run.setToolTip(
+            "立刻终止正在运行的程序（连它开的子进程一起杀）。\n"
+            "注意：等你输入的时间本来就不算超时，所以一般用不着它——\n"
+            "程序真的卡在死循环里出不来时才点。")
+        self.btn_stop_run.setEnabled(False)
+        self.btn_stop_run.clicked.connect(self._stop_run)
+        _corner = QWidget()
+        _cl = QHBoxLayout(_corner)
+        _cl.setContentsMargins(0, 0, 0, 0)
+        _cl.setSpacing(6)
+        _cl.addWidget(self.btn_end_input)
+        _cl.addWidget(self.btn_stop_run)
+        self.tabs.setCornerWidget(_corner, Qt.TopRightCorner)
         # 讲解栏和运行输出都装上平滑滚动（滚轮变成短动画，读长内容不跳）
         self._scrollers = [SmoothScroller(self.view), SmoothScroller(self.view_run)]
         self._run_watch = QTimer(self)
@@ -2677,10 +2707,12 @@ class MainWindow(QMainWindow):
         self.run_worker.start()
         self.btn_send_input.setEnabled(True)
         self.btn_end_input.setEnabled(True)
+        self.btn_stop_run.setEnabled(True)
         # 盯着"突然不出声了"：多半是程序停在 scanf 上等人输入，
         # 不提示的话学生只会看到一片空白，以为程序卡死、运行很慢。
         self._last_chunk_at = time.time()
         self._idle_hint_shown = False
+        self._stopped_by_user = False
         self._run_watch.start()
 
     def do_run(self):
@@ -2714,8 +2746,8 @@ class MainWindow(QMainWindow):
             return
         self._idle_hint_shown = True
         self._append_note(
-            "（已经 2 秒没有新输出了：如果程序在等 scanf，请在下面输入框里"
-            "输入后回车；输完了点「结束输入」。如果它不需要输入，可能是在算，稍等。）")
+            "（已经 2 秒没有新输出了：如果程序在等 scanf，在下面输入框里输入后回车就行，"
+            "等多久都不会超时；如果它不用输入，那就是在算，稍等，或者点右上角「停止」。）")
 
     def _send_input(self):
         """把输入框里的这一行送进正在运行的程序（半交互）。
@@ -2742,7 +2774,8 @@ class MainWindow(QMainWindow):
         """告诉程序"没有更多输入了"（EOF）。
 
         为什么需要它：`while (scanf(...) != EOF)`、`gets` 循环这类程序，
-        只有读到 EOF 才会往下走；不给 EOF 就只能等到超时被杀，看起来像"卡死"。
+        只有读到 EOF 才会往下走；不给 EOF，程序就一直停在那里等下一行输入
+        （等输入不算超时，所以会一直等下去，不会自己结束）。
         """
         w = self.run_worker
         if w is None or not w.isRunning():
@@ -2754,6 +2787,26 @@ class MainWindow(QMainWindow):
         # EOF 之后程序不会再读 stdin，两个按钮都收起来，免得学生白点
         self.btn_send_input.setEnabled(False)
         self.btn_end_input.setEnabled(False)
+
+    def _stop_run(self):
+        """「停止」：真的卡住时的手动出口。
+
+        等输入的时间已经不算超时了，所以正常情况下用不着这个按钮；
+        留着是给"死循环但一直有输出"和"程序睡着不干活"这类情况兜底——
+        没有它，半交互模式下唯一能终止程序的办法就是关掉整个面板。
+        """
+        w = self.run_worker
+        if w is None or not w.isRunning():
+            self.status.showMessage("程序没在运行——先按 F9")
+            return
+        if not w.stop():
+            return
+        self._stopped_by_user = True
+        self.btn_stop_run.setEnabled(False)
+        self.btn_send_input.setEnabled(False)
+        self.btn_end_input.setEnabled(False)
+        self._append_note("—— 已请求停止，正在终止程序… ——")
+        self.status.showMessage("正在停止…")
 
     def _append_note(self, text: str):
         cur = self.view_run.textCursor()
@@ -2772,6 +2825,7 @@ class MainWindow(QMainWindow):
     def _on_run_failed(self, tb: str):
         self.btn_send_input.setEnabled(False)
         self.btn_end_input.setEnabled(False)
+        self.btn_stop_run.setEnabled(False)
         self._run_watch.stop()
         self.btn_run.setEnabled(True)
         self.btn_check.setEnabled(True)
@@ -2787,6 +2841,7 @@ class MainWindow(QMainWindow):
         self.btn_check.setEnabled(True)
         self.btn_send_input.setEnabled(False)
         self.btn_end_input.setEnabled(False)
+        self.btn_stop_run.setEnabled(False)
         self._run_watch.stop()
 
         if not res.compiled:
@@ -2827,7 +2882,9 @@ class MainWindow(QMainWindow):
         # 「多半是死循环」这类提示是初学者最需要的那句话。
         if res.timed_out:
             self.status.showMessage(
-                "运行超时已终止（可能在等输入，也可能是死循环——看下方提示）")
+                "程序连续算了太久，已终止（等输入的时间不算，可能是死循环）")
+        elif res.exit_code == -15:
+            self.status.showMessage("运行已手动停止")
         elif res.ok:
             self.status.showMessage("运行结束　用时 %.2f 秒" % res.duration)
         elif res.exit_code:
@@ -2841,7 +2898,9 @@ class MainWindow(QMainWindow):
         for n in (res.notes or []):
             lines.append("· " + n)
         if res.timed_out:
-            lines.append("—— 超时被强制终止 ——")
+            lines.append("—— 连续算了太久被终止（等输入的时间不算）——")
+        elif res.exit_code == -15:
+            lines.append("—— 已手动停止 ——")
         elif res.ok:
             lines.append("—— 运行结束，用时 %.2f 秒 ——" % res.duration)
         else:
