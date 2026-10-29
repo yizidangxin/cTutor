@@ -36,6 +36,7 @@ class Diagnostic:
     line: int = 0
     column: int = 0
     origin: str = "sarif"         # sarif | text —— 记录来源，便于排查
+    col_unit: str = ""            # 列号单位："" 按编译器默认 / "byte" / "display"
     fixits: List[FixIt] = field(default_factory=list)
     raw: str = ""
 
@@ -73,6 +74,7 @@ class Diagnostic:
             "line": self.line,
             "column": self.column,
             "origin": self.origin,
+            "col_unit": self.col_unit,
             "fixits": [str(f) for f in self.fixits],
         }
 

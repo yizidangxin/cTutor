@@ -23,6 +23,22 @@ def _normalize(s: str) -> str:
     return re.sub(r"\s+", " ", re.sub(r"[^0-9a-zA-Z ]+", " ", s.lower())).strip()
 
 
+def _code_keys(code: str) -> List[str]:
+    """一个诊断码在库里的所有可能写法（大写）。
+
+    GCC 的警告码带参数时会长尾巴：`-Wformat=`、`-Wimplicit-fallthrough=`、
+    `-Wformat=2`。库里按 `-Wformat` 收录，如果只按原样查就会"差一个等号"
+    判成未收录——实测正是这条让 3 个 printf 样本掉进"未覆盖"。
+    """
+    out: List[str] = []
+    raw = (code or "").strip()
+    for k in (raw, raw.rstrip("="), raw.split("=", 1)[0]):
+        k = k.strip().upper()
+        if k and k not in out:
+            out.append(k)
+    return out
+
+
 FILES = {"msvc": "msvc.json", "gcc": "gcc.json"}
 
 
@@ -84,7 +100,11 @@ class KnowledgeBase:
         """
         # 1) 错误码精确匹配
         if diag.code:
-            candidates = self._by_code.get(diag.code.upper(), [])
+            candidates = []
+            for key in _code_keys(diag.code):
+                candidates = self._by_code.get(key, [])
+                if candidates:
+                    break
             if len(candidates) == 1:
                 return candidates[0]                      # 唯一候选，直接采用
             for e in candidates:                          # 多候选用消息细化
@@ -118,8 +138,9 @@ class KnowledgeBase:
         """
         if not token:
             return False
-        if token.upper() in self._by_code:
-            return True
+        for key in _code_keys(token):
+            if key in self._by_code:
+                return True
         norm = _normalize(token)
         for np in self._norm_patterns:
             if np in norm or norm in np:

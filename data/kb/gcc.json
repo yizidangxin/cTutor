@@ -263,22 +263,30 @@
     },
     {
       "code": "-Wformat",
-      "title": "printf 的格式符和参数类型不匹配（警告）",
+      "title": "printf 的格式符和参数对不上（个数或类型，警告）",
       "match_message": [
         "format '%",
-        "expects argument of type"
+        "expects argument of type",
+        "expects a matching",
+        "too many arguments for format"
       ],
-      "one_line": "printf 里的 %d、%f、%s 和后面实际传进去的变量类型对不上。",
+      "one_line": "printf 里的 %d、%f、%s 和后面实际传进去的变量数目或类型对不上。",
       "why": [
         "%d 只接受 int，%f 接受 double，%s 接受字符串（char*），%c 接受单个字符。",
+        "格式符比参数多（少给了变量）或参数比格式符多（多给了变量），编译器都会警告。",
         "传错类型时 printf 会按错误的宽度读内存，输出乱码甚至崩溃。"
       ],
       "how_to_fix": [
-        "核对每个 % 和后面的变量一一对应。",
-        "double 用 %f，int 用 %d，long long 用 %lld，char 用 %c，字符串用 %s。"
+        "数一数格式串里有几个 %，再看后面逗号隔开几个变量，必须一一对应。",
+        "double 用 %f，int 用 %d，long long 用 %lld，char 用 %c，字符串用 %s。",
+        "想百分号本身，写 %%（两个半角百分号）。"
       ],
       "pitfalls": [
         "%d 和 %f 混用最常见。另外整型除法：1/2 得 0，想得 0.5 要写 1.0/2。"
+      ],
+      "aliases": [
+        "-Wformat=",
+        "-Wformat=2"
       ]
     },
     {

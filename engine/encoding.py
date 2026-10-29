@@ -131,7 +131,7 @@ def source_lines(path: str, center: int, context: int = 2) -> "tuple[List[str], 
 
 
 def col_to_char_index(line_text: str, col: int, compiler: str = "msvc",
-                      encoding: str = "utf-8") -> int:
+                      encoding: str = "utf-8", col_unit: str = "") -> int:
     """把编译器给的**列号**换算成该行里的**字符下标**（0 基）。列号 <=0 时返回 -1。
 
     这是本项目最容易错、也最难发现的一处（评审把它列为「三个先验证的坑」之首）。
@@ -141,14 +141,26 @@ def col_to_char_index(line_text: str, col: int, compiler: str = "msvc",
             汉字数 N=0 → 列=16，N=1 → 19，N=2 → 22，N=4 → 28
             即 列 = 字符列 + 2 × 之前出现的双字节字符数
 
-        GCC：我们给它传了 -fdiagnostics-column-unit=byte，所以列号是 1 基**字节**偏移。
+        GCC 带 -fdiagnostics-column-unit=byte：列号是 1 基**字节**偏移。
 
-    纯 ASCII 行两种模型一致，因此这个 bug 只有在中文出现时才暴露——
-    按字符列直接画插入符，每遇一个汉字就会偏 2 列。
+        GCC 不带那个开关（老版本 GCC 8 就不认，实测 MinGW 8.1）：
+            列号是**显示宽度**——每个汉字算 2 列。汉字数 N 时列 = 21 + 2N。
+            所以 col_unit="display" 时按"汉字占 2 列"反解。
+
+    纯 ASCII 行三种模型一致，因此这个 bug 只有在中文出现时才暴露——
+    按字符列直接画插入符，每遇一个汉字就会偏 2 列（或按字节反解时整行错位）。
     """
     if col <= 0 or not line_text:
         return -1
     target = col - 1
+
+    if col_unit == "display":
+        width = 0
+        for i, ch in enumerate(line_text):
+            if width >= target:
+                return i
+            width += 2 if ord(ch) > 0x2E80 else 1
+        return len(line_text)
 
     if compiler == "gcc":
         try:
@@ -171,20 +183,20 @@ def col_to_char_index(line_text: str, col: int, compiler: str = "msvc",
 
 
 def char_col(line_text: str, col: int, compiler: str = "msvc",
-             encoding: str = "utf-8") -> int:
+             encoding: str = "utf-8", col_unit: str = "") -> int:
     """换算成给初学者看的「第几列」（按字符计，与编辑器里看到的一致）。"""
-    idx = col_to_char_index(line_text, col, compiler, encoding)
+    idx = col_to_char_index(line_text, col, compiler, encoding, col_unit)
     return idx + 1 if idx >= 0 else col
 
 
 def caret_line(text: str, column: int, compiler: str = "msvc",
-               encoding: str = "utf-8") -> str:
+               encoding: str = "utf-8", col_unit: str = "") -> str:
     """在给定列位置生成插入符定位行。
 
     先做列号语义换算，再按**显示宽度**补空格（CJK 占两列），
     这样插入符才能落在终端里正确的位置。
     """
-    idx = col_to_char_index(text, column, compiler, encoding)
+    idx = col_to_char_index(text, column, compiler, encoding, col_unit)
     if idx < 0:
         return ""
     pad = sum(2 if ord(ch) > 0x2E80 else 1 for ch in text[:idx])

@@ -91,7 +91,8 @@ def layers(exp: Explanation) -> List[Tuple[str, List[str]]]:
         loc.append("出错位置：")
         loc.extend("  " + s for s in exp.snippet)
         if exp.line_text and d.column:
-            caret = caret_line(exp.line_text, d.column, d.compiler, exp.snippet_enc)
+            caret = caret_line(exp.line_text, d.column, d.compiler, exp.snippet_enc,
+                              getattr(d, "col_unit", ""))
             if caret:
                 pad = len(exp.snippet[0].split("|")[0]) if exp.snippet else 0
                 loc.append("  " + " " * pad + "| " + caret)

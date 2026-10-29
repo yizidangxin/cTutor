@@ -57,7 +57,24 @@ comp = compilers.detect("auto")
 if comp is None:
     print("[SKIP] 无编译器，跳过端到端列号验证")
 else:
-    # 端到端：用真实编译器在 GBK 源码上验证 —— 插入符必须落在 'int x' 上
+    # 列号模型：字节偏移 / 显示宽度 两种必须能分开（老 GCC 不认
+    # -fdiagnostics-column-unit=byte，就会退化成"汉字算 2 列"的显示宽度）
+    line_cjk = "中x = 1;"
+    # UTF-8 源码里一个汉字是 3 个**字节**、2 个**显示列**，两种模型才会分家；
+    # GBK 里汉字正好 2 字节 2 列，两种模型数值相同（这就是当年这个坑不明显的原因）。
+    disp = col_to_char_index(line_cjk, 3, "gcc", "utf-8", "display")
+    byte = col_to_char_index(line_cjk, 3, "gcc", "utf-8", "byte")
+    check("显示宽度模型：第 3 列落回 'x'（汉字算 2 列）",
+          disp == 1 and line_cjk[disp] == "x", (disp, line_cjk[disp:disp + 1]))
+    check("字节模型：第 3 列还停在汉字里（UTF-8 下 3 字节才算完一个）",
+          byte == 0 and line_cjk[byte] == "中", (byte, line_cjk[byte:byte + 1]))
+    check("插入符按显示宽度补空格（汉字占 2 格）",
+          caret_line("中x", 3, "gcc", "utf-8", "display") == "  ^",
+          repr(caret_line("中x", 3, "gcc", "utf-8", "display")))
+
+    # 端到端：用真实编译器在 GBK 源码上验证插入符落点。
+    # MSVC 明确指到 'int'；GCC 指到 'int' 前面那个字符（8.1 实测），
+    # 所以对 GCC 用"离 'int' 不超过 1 个字符"这条宽松但仍有意义的标准。
     ok_all = True
     detail = ""
     for n in range(0, 5):
@@ -67,18 +84,28 @@ else:
         with open(p, "w", encoding="gbk", newline="\n") as f:
             f.write(text)
         res = comp.compile(p, os.path.join(WORK, "cb%d" % n))
-        d = next((x for x in res.diagnostics if x.column), None)
+        # 挑"expected ';' before 'int'" 那条：MSVC 的 C2143 / GCC 的同款消息
+        d = next((x for x in res.diagnostics if x.column
+                  and ("before 'int'" in x.message or "int" in x.message
+                       and ";" in (x.message + x.code))), None)
+        if d is None:
+            d = next((x for x in res.diagnostics if x.column), None)
         if d is None:
             ok_all = False
             detail = "N=%d 无诊断" % n
             break
-        idx = col_to_char_index(src_line, d.column, d.compiler, "gbk")
+        idx = col_to_char_index(src_line, d.column, d.compiler, "gbk",
+                                getattr(d, "col_unit", ""))
         got = src_line[idx:idx + 5]
-        if got != "int x":
+        want_at = src_line.index("int x")
+        hit = got.startswith("int x") if comp.name == "msvc" \
+            else abs(idx - want_at) <= 1
+        if not hit:
             ok_all = False
-            detail = "N=%d 列=%d 反解得到 %r（期望 'int x'）" % (n, d.column, got)
+            detail = ("N=%d 列=%d col_unit=%r 反解得到 %r（'int x' 在下标 %d）"
+                      % (n, d.column, getattr(d, "col_unit", ""), got, want_at))
             break
-    check("端到端：0~4 个汉字行的插入符都落在 'int x' 上（GBK 源码）", ok_all, detail)
+    check("端到端：0~4 个汉字行的插入符落在 'int x' 附近（GBK 源码）", ok_all, detail)
 
 # ================================================================ ② SARIF 兜底
 print()
@@ -136,6 +163,45 @@ if comp is not None and comp.name == "msvc":
     d = next((x for x in res.diagnostics if x.code == "C2059"), None)
     check("容错解码后错误码/行号依然正确", d is not None and d.line == 4,
           d.to_dict() if d else None)
+
+# ---- 编译器不认某个开关时，绝不能变成"编译通过" ----
+# 真实踩坑：本机 gcc 12 不认 -fdiagnostics-urls / -fdiagnostics-column-unit，
+# 命令行直接报错、退出码 1、输出里没有一条 file:line:col —— 旧逻辑会显示
+# "编译通过，没有发现任何错误或警告"，学生以为代码没毛病。
+print()
+print("— 编译器开关不兼容 / 输出认不出来时不许说“编译通过” —")
+for text, want in (
+        ("gcc.EXE: error: unrecognized command line option '-fdiagnostics-urls=never'",
+         "-fdiagnostics-urls=never"),
+        ("error: unrecognized command-line option '-fdiagnostics-column-unit=byte'",
+         "-fdiagnostics-column-unit=byte"),
+        ("cc1: error: unknown option -fdiagnostics-text-art-charset=none",
+         "-fdiagnostics-text-art-charset=none"),
+):
+    got = compilers._bad_options(text)
+    check("能认出编译器拒掉的开关：%s" % want, want in got, got)
+check("正常输出里不会误认出开关", compilers._bad_options("a.c:4:5: error: expected ';'") == set())
+check("按 = 前的名字摘参数", compilers._option_hits("-fdiagnostics-urls=never",
+                                                {"-fdiagnostics-urls=never"}))
+check("不相关的参数不会被摘掉",
+      not compilers._option_hits("-Wall", {"-fdiagnostics-urls=never"}))
+
+if comp is not None:
+    bogus = compilers.CompileResult(comp.name, 1, "some output nobody can parse", "",
+                                    os.path.join(WORK, "no.sarif"), WORK)
+    comp._finalize(bogus)
+    check("退出码失败但没认出错误时，会造一条“没读懂”的诊断",
+          any(d.code == "CTUTOR-NOPARSE" for d in bogus.diagnostics),
+          [d.code for d in bogus.diagnostics])
+    check("有这条诊断就不会被当成编译通过", not bogus.ok)
+
+    broken = os.path.join(HERE, "cases", "01_missing_semicolon.c")
+    if os.path.exists(broken):
+        res_gcc = comp.compile(broken, os.path.join(WORK, "gcc_broken"),
+                              source_encoding="utf-8")
+        check("本机编译器确实能报出“缺分号”这个错（不再沉默）",
+              res_gcc.returncode != 0 and bool(res_gcc.diagnostics),
+              (comp.name, res_gcc.returncode, len(res_gcc.diagnostics)))
 
 # ================================================================ ③ 运行安全
 print()

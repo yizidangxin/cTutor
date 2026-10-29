@@ -14,6 +14,7 @@
 """
 import glob
 import os
+import re
 import shutil
 import subprocess
 import threading
@@ -270,8 +271,32 @@ __attribute__((constructor)) static void ctutor_unbuffer_ctor(void)
 UNBUFFER_VERSION = "unbuffer-3"
 
 
+# 编译器说"我不认这个开关"的几种写法（GCC 12 / 14 / MSVC 措辞都不一样）
+_OPT_ERR_RE = re.compile(
+    r"(?:unrecognized command[- ]line option|unrecognized option|unknown option)"
+    r"\s*[: ]?\s*'?(-{1,2}[A-Za-z0-9][^\s'\";,、]*)")
+
+
+def _bad_options(text: str) -> set:
+    """从编译器输出里捞出"它不认哪些开关"（返回开关原文，含 =值）。"""
+    out = set()
+    for m in _OPT_ERR_RE.finditer(text or ""):
+        opt = m.group(1).rstrip("'")
+        if opt:
+            out.add(opt)
+    return out
+
+
+def _option_hits(arg: str, bad: set) -> bool:
+    """这个命令行参数是不是编译器刚才拒掉的那个（按 = 前的名字比，容忍值写法不同）。"""
+    key = arg.split("=", 1)[0]
+    for b in bad:
+        if arg == b or key == b or key == b.split("=", 1)[0]:
+            return True
+    return False
+
+
 def _is_utf8(enc: Optional[str]) -> bool:
-    """这个编码名是不是 UTF-8（含带 BOM 的写法）。"""
     n = (enc or "").strip().lower().replace("-", "").replace("_", "")
     return n in ("utf8", "utf8bom", "utf8sig")
 
@@ -608,6 +633,9 @@ class Compiler:
         self.max_bytes = int(c.get("max_output_bytes", 2_000_000))
         self.std = c.get("std", "c17")
         self.warnings = bool(c.get("warnings", True))
+        # 列号单位：由真正生效的编译开关决定（老 GCC 不认 column-unit 开关时
+        # 会退化到显示宽度，见 encoding.col_to_char_index 的实测模型）。
+        self.col_unit = ""
 
     def compile(self, source: str, workdir: str, std: Optional[str] = None,
                 warnings: Optional[bool] = None,
@@ -640,12 +668,31 @@ class Compiler:
             if status != "missing":
                 res.notes.append("SARIF %s，已回退到文本解析" % sarif_mod.describe(status))
         res.diagnostics = dedupe(merged)
+        for _d in res.diagnostics:
+            if not _d.col_unit:
+                _d.col_unit = self.col_unit
         if res.timed_out:
             res.diagnostics.insert(0, Diagnostic(
                 compiler=self.name, level="fatal error", code="CTUTOR-TIMEOUT",
                 message="编译超时（%d 秒），已终止编译器进程" % self.timeout,
                 origin="tool"))
             res.notes.append("编译超时")
+        # 兜底：编译器说失败（退出码不是 0），但我们一条错误都没解析出来。
+        # 这种情况绝不能显示"编译通过"——宁可明说"没读懂"，也不能骗学生。
+        # （真实踩到的例子：老版本 GCC 不认某个开关，命令行直接报错，
+        #  所有错误行都不是 file:line:col 格式，文本解析一条都匹配不上。）
+        if res.returncode != 0 and not res.diagnostics:
+            first = ""
+            for line in (res.stdout or "").splitlines():
+                if line.strip():
+                    first = line.strip()
+                    break
+            res.diagnostics.insert(0, Diagnostic(
+                compiler=self.name, level="fatal error", code="CTUTOR-NOPARSE",
+                message="编译器返回了失败（退出码 %d），但没能从它的输出里认出具体是哪条错误。"
+                        "原始输出：%s" % (res.returncode, first[:200] or "（空）"),
+                origin="tool"))
+            res.notes.append("编译器输出没能解析成诊断")
         if res.truncated:
             res.notes.append("编译器输出被截断")
         return res
@@ -867,15 +914,31 @@ class GccCompiler(Compiler):
         code = -1
         raw_out = raw_err = b""
         timed_out = truncated = False
+        # 老版本 GCC（本机 E:\VS Code\mingw64 就是 12）不认
+        # -fdiagnostics-urls / -fdiagnostics-column-unit 这些新开关。
+        # 以前只按固定字符串判断"这轮失败"，新老写法对不上时就会把
+        # "命令行报错、退出码 1、没有任何诊断"当成"编译通过"——所以这里自适应地
+        # 把编译器不认的开关摘掉重试，而不是只换 SARIF 变体。
         for extra in variants:
-            args = base + extra + [source, "-o", exe]
-            code, raw_out, raw_err, timed_out, truncated = run_safely(
-                args, workdir, self.timeout, self.max_bytes)
-            text = smart_decode(raw_out) + smart_decode(raw_err)
-            if "unrecognized command-line option" in text or "unrecognized option" in text:
-                continue
-            break
+            extra = list(extra)
+            for _attempt in range(6):
+                code, raw_out, raw_err, timed_out, truncated = run_safely(
+                    base + extra + [source, "-o", exe],
+                    workdir, self.timeout, self.max_bytes)
+                bad = _bad_options(smart_decode(raw_out) + smart_decode(raw_err))
+                if not bad:
+                    break
+                before = (tuple(base), tuple(extra))
+                base = [a for a in base if not _option_hits(a, bad)]
+                extra = [a for a in extra if not _option_hits(a, bad)]
+                if (tuple(base), tuple(extra)) == before:
+                    break               # 摘不掉了，别再空转
+            if not _bad_options(smart_decode(raw_out) + smart_decode(raw_err)):
+                break                       # 这轮成功用上了，不再换变体
 
+        # 开关被摘掉了（老 GCC 不认）→ 它的列号是显示宽度，不再是字节偏移。
+        self.col_unit = ("byte" if any("column-unit=byte" in a for a in base)
+                         else "display")
         text = smart_decode(raw_out) + "\n" + smart_decode(raw_err)
         res = CompileResult(self.name, code, text, "", sarif_path, workdir,
                             exe if os.path.exists(exe) else "")
