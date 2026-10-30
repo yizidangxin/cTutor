@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta http-equiv="Content-Security-Policy"
+      content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline';" />
+<title>ctutor</title>
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    font-family: var(--vscode-font-family);
+    font-size: var(--vscode-font-size);
+    color: var(--vscode-foreground);
+    padding: 10px 14px 28px;
+  }
+  h1 { font-size: 1.05em; margin: 6px 0 2px; font-weight: 600; }
+  .sub { opacity: .7; margin: 0 0 14px; font-size: .92em; line-height: 1.5; }
+  .card {
+    border: 1px solid var(--vscode-panel-border, rgba(128,128,128,.35));
+    border-radius: 6px; padding: 10px 12px; margin: 0 0 12px;
+    background: var(--vscode-editorWidget-background, transparent);
+  }
+  .master { display: flex; align-items: center; gap: 10px; }
+  .master .title { font-weight: 600; }
+  .row { display: flex; align-items: flex-start; gap: 10px; padding: 7px 0; }
+  .row + .row { border-top: 1px dashed var(--vscode-panel-border, rgba(128,128,128,.25)); }
+  .row .text { flex: 1; }
+  .row .name { font-weight: 500; }
+  .row .desc { opacity: .72; font-size: .9em; margin-top: 2px; line-height: 1.45; }
+  .sw {
+    position: relative; width: 38px; height: 20px; border-radius: 10px; flex: none;
+    background: var(--vscode-input-background, #444); cursor: pointer; margin-top: 2px;
+    border: 1px solid var(--vscode-input-border, transparent); transition: background .12s;
+  }
+  .sw::after {
+    content: ''; position: absolute; top: 2px; left: 2px; width: 14px; height: 14px;
+    border-radius: 50%; background: var(--vscode-foreground); opacity: .85; transition: left .12s;
+  }
+  .sw.on { background: var(--vscode-button-background, #0a7); }
+  .sw.on::after { left: 20px; background: var(--vscode-button-foreground, #fff); opacity: 1; }
+  .sw.disabled { opacity: .4; cursor: not-allowed; }
+  .btns { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 4px; }
+  button {
+    font-family: inherit; font-size: .95em; padding: 5px 12px; border-radius: 4px; cursor: pointer;
+    color: var(--vscode-button-foreground); background: var(--vscode-button-background);
+    border: 1px solid transparent;
+  }
+  button.ghost {
+    color: var(--vscode-button-secondaryForeground, var(--vscode-foreground));
+    background: var(--vscode-button-secondaryBackground, transparent);
+    border-color: var(--vscode-panel-border, rgba(128,128,128,.4));
+  }
+  button:hover { filter: brightness(1.1); }
+  .meta { opacity: .72; font-size: .88em; line-height: 1.6; }
+  .layer { margin: 0 0 12px; }
+  .layer h3 {
+    font-size: .95em; margin: 0 0 4px; color: var(--vscode-textLink-foreground, #4ea1ff);
+  }
+  .layer pre {
+    margin: 0; white-space: pre-wrap; word-break: break-word;
+    font-family: var(--vscode-editor-font-family, monospace); font-size: .92em; line-height: 1.55;
+  }
+  .empty { opacity: .65; font-size: .9em; }
+  .badge {
+    display: inline-block; padding: 0 6px; border-radius: 8px; font-size: .82em;
+    background: var(--vscode-badge-background); color: var(--vscode-badge-foreground);
+    margin-left: 6px;
+  }
+</style>
+</head>
+<body>
+  <h1>ctutor：只管 VS Code 不管的那几件事</h1>
+  <p class="sub">
+    编辑器功能（补全、格式化、跳转、调试、Git）全部交给 VS Code，这里只有四样东西：
+    中文讲解、只讲一条、改完复检、等输入不超时。
+  </p>
+
+  <div class="card master">
+    <span class="sw" id="sw-master" role="switch" aria-checked="true"></span>
+    <div class="text">
+      <div class="title">总开关</div>
+      <div class="desc" id="master-desc">关闭后 ctutor 完全不介入：不检查、不画波浪线、不提供修复与运行。</div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <span class="sw" id="sw-explain" role="switch"></span>
+      <div class="text">
+        <div class="name">中文分层讲解</div>
+        <div class="desc">悬停报错行看五层讲解（结论 / 定位 / 原因 / 改法 / 知识点）；编辑器里那条 CodeLens 也来自这里。</div>
+      </div>
+    </div>
+    <div class="row">
+      <span class="sw" id="sw-first" role="switch"></span>
+      <div class="text">
+        <div class="name">只讲最关键的一条</div>
+        <div class="desc">一次报 30 条时只画 1 条波浪线——后面 29 条几乎都是它引起的。关掉就全部显示。</div>
+      </div>
+    </div>
+    <div class="row">
+      <span class="sw" id="sw-diagnostics" role="switch"></span>
+      <div class="text">
+        <div class="name">自己画波浪线</div>
+        <div class="desc">用 ctutor 的诊断（中文结论）替代编译器原文。若同时开了 C/C++ 扩展的报错高亮，会出现两套，建议只留一边。</div>
+      </div>
+    </div>
+    <div class="row">
+      <span class="sw" id="sw-fix" role="switch"></span>
+      <div class="text">
+        <div class="name">改一下（修复并复检）</div>
+        <div class="desc">缺分号、全角标点这类有确定性修法的错误，改完**重新编译验证**通过才写进文件；没通过就不动你的代码。</div>
+      </div>
+    </div>
+    <div class="row">
+      <span class="sw" id="sw-run" role="switch"></span>
+      <div class="text">
+        <div class="name">运行（等输入不计时）</div>
+        <div class="desc">在 VS Code 终端里运行当前文件；程序等 scanf 的时候不计超时，死循环可以一键停止。</div>
+      </div>
+    </div>
+    <div class="row">
+      <span class="sw" id="sw-ai" role="switch"></span>
+      <div class="text">
+        <div class="name">AI 兜底讲解</div>
+        <div class="desc">默认关闭。只有本地知识库没收录的错误才需要它，且要自己配 DeepSeek 密钥；本地命中时不会联网、不花钱。</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="btns">
+      <button id="btn-check">检查当前文件</button>
+      <button id="btn-fix" class="ghost">改一下</button>
+      <button id="btn-run" class="ghost">运行</button>
+      <button id="btn-stop" class="ghost">停止</button>
+    </div>
+    <p class="meta" id="meta">尚未检查。</p>
+  </div>
+
+  <div class="card" id="explain-card">
+    <h1 style="margin-top:0">讲解</h1>
+    <div id="explain"><p class="empty">把光标放到报错行，或点编辑器里的「ctutor：这一条错在讲什么」。</p></div>
+  </div>
+
+<script>
+  const vscode = acquireVsCodeApi();
+  const $ = (id) => document.getElementById(id);
+  let STATE = null;
+
+  function setSwitch(el, on, disabled) {
+    el.classList.toggle('on', !!on);
+    el.setAttribute('aria-checked', on ? 'true' : 'false');
+    el.classList.toggle('disabled', !!disabled);
+  }
+
+  function render(state) {
+    STATE = state;
+    const master = state.enabled;
+    setSwitch($('sw-master'), master, false);
+    setSwitch($('sw-explain'), state.features.explain, !master);
+    setSwitch($('sw-first'), state.firstOnly, !master);
+    setSwitch($('sw-diagnostics'), state.features.diagnostics, !master);
+    setSwitch($('sw-fix'), state.features.quickFix, !master);
+    setSwitch($('sw-run'), state.features.run, !master);
+    setSwitch($('sw-ai'), state.features.ai, !master);
+    $('master-desc').textContent = master
+      ? '当前：已启用。关掉它等于把所有功能一次性闭麦。'
+      : '当前：已关闭。波浪线已清除，ctutor 不再介入编辑。';
+    const kb = state.kb ? ('知识库 msvc ' + state.kb.msvc + ' 条 / gcc ' + state.kb.gcc + ' 条') : '知识库加载中…';
+    const n = state.count || 0;
+    $('meta').textContent = state.hasFile
+      ? ('本次检查：' + n + ' 条报错' + (state.firstOnly && n ? '（只显示最关键的一条）' : '') + '　·　' + kb)
+      : ('当前文件还没有检查结果，按 Ctrl+Alt+C 检查。　·　' + kb);
+  }
+
+  function renderExplain(explanation, chosen, fileName) {
+    const box = $('explain');
+    if (!explanation) {
+      box.innerHTML = '<p class="empty">这条错误没有讲解数据。</p>';
+      return;
+    }
+    const parts = [];
+    const title = explanation.title || '编译器报错';
+    const matched = explanation.matched;
+    parts.push('<p><strong>' + esc(title) + '</strong>' +
+      (matched ? '' : '<span class="badge">知识库未收录</span>') +
+      (fileName ? '<span class="badge">' + esc(fileName) + '</span>' : '') + '</p>');
+    if (chosen && chosen.message) {
+      parts.push('<p class="meta">编译器原文：<code>' + esc(chosen.message) + '</code></p>');
+    }
+    (explanation.layers || []).forEach((layer) => {
+      parts.push('<div class="layer"><h3>' + esc(layer.title) + '</h3><pre>' +
+        esc((layer.lines || []).join('\n')) + '</pre></div>');
+    });
+    const ai = explanation.ai;
+    if (ai) {
+      parts.push('<div class="layer"><h3>AI 补充' +
+        (explanation.ai_meta ? '（' + esc(explanation.ai_meta) + '）' : '') + '</h3><pre>' +
+        esc(typeof ai === 'string' ? ai : JSON.stringify(ai, null, 2)) + '</pre></div>');
+    }
+    box.innerHTML = parts.join('');
+  }
+
+  function esc(s) {
+    return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  }
+
+  // 每个开关只对应一个配置项；总开关单独走 enabled
+  const toggles = [
+    ['sw-master', 'enabled', (s) => s.enabled],
+    ['sw-explain', 'features.explain', (s) => s.features.explain],
+    ['sw-first', 'explain.firstOnly', (s) => s.firstOnly],
+    ['sw-diagnostics', 'features.diagnostics', (s) => s.features.diagnostics],
+    ['sw-fix', 'features.quickFix', (s) => s.features.quickFix],
+    ['sw-run', 'features.run', (s) => s.features.run],
+    ['sw-ai', 'features.ai', (s) => s.features.ai]
+  ];
+  toggles.forEach((row) => {
+    const id = row[0];
+    const key = row[1];
+    const read = row[2];
+    $(id).addEventListener('click', () => {
+      if (!STATE) { return; }
+      if (!STATE.enabled && id !== 'sw-master') { return; }
+      vscode.postMessage({ type: 'set', key: key, value: !read(STATE) });
+    });
+  });
+
+  $('btn-check').addEventListener('click', () => vscode.postMessage({ type: 'action', name: 'check' }));
+  $('btn-fix').addEventListener('click', () => vscode.postMessage({ type: 'action', name: 'fix' }));
+  $('btn-run').addEventListener('click', () => vscode.postMessage({ type: 'action', name: 'run' }));
+  $('btn-stop').addEventListener('click', () => vscode.postMessage({ type: 'action', name: 'stop' }));
+
+  window.addEventListener('message', (ev) => {
+    const msg = ev.data || {};
+    if (msg.type === 'state') { render(msg.state); }
+    if (msg.type === 'focusExplain') {
+      renderExplain(msg.explanation, msg.chosen, msg.fileName);
+    }
+  });
+</script>
+</body>
+</html>

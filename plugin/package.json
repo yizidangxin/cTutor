@@ -1,0 +1,195 @@
+{
+  "name": "ctutor",
+  "displayName": "ctutor 中文报错讲解",
+  "description": "只讲最关键的那一条编译错误，用中文讲清楚为什么、怎么改；改完自动重新编译验证。编辑器功能全部交给 VS Code。",
+  "version": "0.1.0",
+  "publisher": "yizidangxin",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": [
+    "Education",
+    "Programming Languages",
+    "Linters"
+  ],
+  "keywords": [
+    "c",
+    "chinese",
+    "error",
+    "教学",
+    "报错",
+    "中文"
+  ],
+  "icon": "media/icon.png",
+  "main": "./extension.js",
+  "activationEvents": [
+    "onLanguage:c",
+    "onCommand:ctutor.openPanel"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "ctutor.openPanel",
+        "title": "ctutor：打开开关与讲解面板",
+        "category": "ctutor"
+      },
+      {
+        "command": "ctutor.check",
+        "title": "检查当前文件（中文讲解）",
+        "category": "ctutor"
+      },
+      {
+        "command": "ctutor.run",
+        "title": "运行（等输入不计时）",
+        "category": "ctutor"
+      },
+      {
+        "command": "ctutor.stop",
+        "title": "停止运行",
+        "category": "ctutor"
+      },
+      {
+        "command": "ctutor.applyFix",
+        "title": "改一下（修复并复检）",
+        "category": "ctutor"
+      },
+      {
+        "command": "ctutor.explainAt",
+        "title": "看这一条报错的讲解",
+        "category": "ctutor"
+      },
+      {
+        "command": "ctutor.aiExplain",
+        "title": "问 AI 补一段讲解（需密钥）",
+        "category": "ctutor"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "ctutor.check",
+        "key": "ctrl+alt+c",
+        "when": "editorLangId == c"
+      },
+      {
+        "command": "ctutor.run",
+        "key": "ctrl+alt+r",
+        "when": "editorLangId == c"
+      },
+      {
+        "command": "ctutor.stop",
+        "key": "ctrl+alt+s"
+      },
+      {
+        "command": "ctutor.openPanel",
+        "key": "ctrl+alt+t"
+      }
+    ],
+    "menus": {
+      "editor/context": [
+        {
+          "command": "ctutor.check",
+          "when": "editorLangId == c",
+          "group": "ctutor@1"
+        },
+        {
+          "command": "ctutor.applyFix",
+          "when": "editorLangId == c",
+          "group": "ctutor@2"
+        },
+        {
+          "command": "ctutor.run",
+          "when": "editorLangId == c",
+          "group": "ctutor@3"
+        },
+        {
+          "command": "ctutor.openPanel",
+          "group": "ctutor@9"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "ctutor.explainAt",
+          "when": "false"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "ctutor",
+      "properties": {
+        "ctutor.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "总开关。关闭后 ctutor 完全退出：不检查、不画波浪线、不提供修复与运行。"
+        },
+        "ctutor.features.explain": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "**中文分层讲解**：悬停报错行时显示五层讲解（结论 / 定位 / 原因 / 改法 / 知识点）。这是 VS Code 本身没有的能力。"
+        },
+        "ctutor.features.diagnostics": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "**自己画波浪线**：用 ctutor 的诊断（中文结论）替代编译器原文。若同时开启 C/C++ 扩展的报错高亮会出现两套，建议只留一边。"
+        },
+        "ctutor.features.quickFix": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "**改一下**：缺分号、全角标点这类有确定性修法的错误，改完重新编译验证通过才写入文件；没通过则不动代码。"
+        },
+        "ctutor.features.run": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "**运行**：在 VS Code 终端里跑当前文件。程序等输入时**不计超时**，死循环可一键停止。"
+        },
+        "ctutor.features.ai": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "**AI 兜底讲解**：默认关闭。只有本地知识库没收录的错误才需要它；需自行配置 DeepSeek 密钥，本地命中时不联网、不花钱。"
+        },
+        "ctutor.explain.firstOnly": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "**只讲最关键的一条**：一次报 30 条错误时只显示 1 条——后面那些几乎都是它引起的。关掉则全部显示。"
+        },
+        "ctutor.compiler": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "gcc",
+            "msvc"
+          ],
+          "default": "auto",
+          "description": "用哪个编译器产诊断：auto 会优先 GCC（贴近教材），找不到再用 MSVC。"
+        },
+        "ctutor.pythonPath": {
+          "type": "string",
+          "default": "",
+          "description": "内核用 Python 运行。留空则自动找 python / python3 / py；找不到就在这里填 python.exe 的完整路径。"
+        },
+        "ctutor.run.timeout": {
+          "type": "number",
+          "default": 10,
+          "markdownDescription": "运行超时（秒）。注意：这里计的是**程序真的在跑的时间**，等用户输入的时间不算；填 0 表示不限时。"
+        },
+        "ctutor.check.delayMs": {
+          "type": "number",
+          "default": 500,
+          "description": "检查的防抖延迟（毫秒）。调大可以减少编译次数。"
+        },
+        "ctutor.check.onType": {
+          "type": "boolean",
+          "default": false,
+          "description": "边打字边检查（默认关闭：只在打开与保存时检查，省得一直起编译器）。"
+        }
+      }
+    }
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/yizidangxin/cTutor"
+  },
+  "bugs": {
+    "url": "https://github.com/yizidangxin/cTutor/issues"
+  }
+}
