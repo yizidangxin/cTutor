@@ -70,7 +70,9 @@ class Uri {
 const store = {
   enabled: true, 'features.explain': true, 'features.diagnostics': true,
   'features.quickFix': true, 'features.run': true, 'features.ai': false,
-  'explain.firstOnly': true, compiler: 'auto', pythonPath: '',
+  'explain.firstOnly': true, compiler: 'auto',
+  // 这台机器上 PATH 里的 python 是商店占位符，真实解释器只在 dsh 运行时里
+  pythonPath: process.env.CTUTOR_PY || '',
   'run.timeout': 10, 'check.delayMs': 0, 'check.onType': false,
 };
 const configuration = {

@@ -67,22 +67,9 @@
     ],
     "keybindings": [
       {
-        "command": "ctutor.check",
-        "key": "ctrl+alt+c",
-        "when": "editorLangId == c"
-      },
-      {
         "command": "ctutor.run",
         "key": "ctrl+alt+r",
         "when": "editorLangId == c"
-      },
-      {
-        "command": "ctutor.stop",
-        "key": "ctrl+alt+s"
-      },
-      {
-        "command": "ctutor.openPanel",
-        "key": "ctrl+alt+t"
       }
     ],
     "menus": {

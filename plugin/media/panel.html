@@ -171,7 +171,7 @@
     const n = state.count || 0;
     $('meta').textContent = state.hasFile
       ? ('本次检查：' + n + ' 条报错' + (state.firstOnly && n ? '（只显示最关键的一条）' : '') + '　·　' + kb)
-      : ('当前文件还没有检查结果，按 Ctrl+Alt+C 检查。　·　' + kb);
+      : ('当前文件还没有检查结果，保存一下或右键「检查当前文件」。　·　' + kb);
   }
 
   function renderExplain(explanation, chosen, fileName) {

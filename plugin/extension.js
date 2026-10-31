@@ -514,7 +514,7 @@ class Ctutor {
     const runId = 'run-' + Date.now();
     this.currentRun = runId;
     this.runs.set(runId, { pty: pty, alive: true, buf: '' });
-    pty.write('\x1b[2m ctutor：等输入的时间不算超时；不输入就一直等。按 Ctrl+Alt+S 可停止。\x1b[0m\r\n\r\n');
+    pty.write('\x1b[2m ctutor：等输入的时间不算超时；不输入就一直等。要停就按 Ctrl+C。\x1b[0m\r\n\r\n');
     try {
       await this.sidecar.call('run', {
         text: doc.getText(),
@@ -551,7 +551,7 @@ class Ctutor {
         if (d) {
           run.pty.write('  第 ' + d.line + ' 行：' + d.message + '\r\n');
         }
-        run.pty.write('  按 Ctrl+Alt+C 检查并看中文讲解。\r\n');
+        run.pty.write('  打开时、保存时会自动检查；也可以右键「检查当前文件」看中文讲解。\r\n');
       } else {
         const bits = [];
         bits.push(res.stopped ? '已手动停止' : (res.timedOut ? '超时被终止' : '正常结束'));
@@ -648,7 +648,7 @@ class Ctutor {
     this.openPanel();
     const report = doc ? this.reports.get(doc.uri.toString()) : this._activeReport();
     if (!report) {
-      vscode.window.showInformationMessage('ctutor：先让它在当前文件上检查一次（Ctrl+Alt+C）。');
+      vscode.window.showInformationMessage('ctutor：先让它检查一次（右键「检查当前文件」或保存一下）。');
       return;
     }
     this.panel.webview.postMessage({
